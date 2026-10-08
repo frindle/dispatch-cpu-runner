@@ -9,8 +9,9 @@ Pull-based: the container polls the queue API over the LAN; the Mac never needs 
 reach into Unraid (Unraid has no SSH). Python stdlib only; Node 22 in the image for jobs.
 
 ## Status
-Built and tested (agent, client, reference queue). **Queue-side endpoints are NOT implemented
-yet** (see "Queue API contract"); nothing in `~/bin` was modified. Real network-namespace
+Built and tested (agent, client, reference queue). **Queue side is implemented** (2026-10-08) in
+`~/bin/cpu_lane.py` + `~/bin/ollama-queue-api.py` (see "Queue side"), with `~/bin/cpu_dispatch.py`
+as the stage-facing wrapper; stages are NOT wired in yet. Real network-namespace
 isolation can only be proven inside the container (`selftest`), see "Isolation".
 
 ## Sizing (Unraid GraphQL, 2026-10-08)
@@ -74,15 +75,38 @@ The dependency-install phase has network (it must) and runs as the unprivileged 
 
 ## Steps for Penn on Unraid
 The files are copied to `/mnt/user/data/dispatch-cpu-runner/` (if not already: copy this directory there, minus `.git`).
-1. Token: `mkdir -p secrets && openssl rand -hex 32 > secrets/token && chmod 600 secrets/token`. The same value
-   must be installed on the Mac at `~/.config/dispatch-cpu-runner/token` (queue API + client read it).
-2. `cp env.example .env`; set `CPU_RUNNER_API=http://<mac-lan-ip>:7684`; adjust concurrency/limits.
+0. On the Mac (already done once; idempotent): `python3 ~/bin/cpu_lane.py token` creates
+   `~/.config/dispatch-cpu-runner/token` (0600, random 32 bytes hex) if absent and prints its PATH only;
+   `python3 ~/bin/cpu_lane.py api-url` prints the exact `CPU_RUNNER_API` value (the Mac's LAN IP, discovered,
+   not the WARP tunnel address). The queue API (dashboard, :7684) must have been restarted once so it serves
+   `/api/cpu/*`; check from any LAN host: `curl http://<mac-lan-ip>:7684/api/cpu/health` -> `{"ok": true}`.
+1. Token: copy the Mac's token file to the data share WITHOUT printing it, e.g. on the Mac
+   `scp ~/.config/dispatch-cpu-runner/token <unraid>:/mnt/user/data/dispatch-cpu-runner/secrets/token`
+   (or paste via the Unraid file browser), then on Unraid `chmod 600 secrets/token`. It must be byte-identical
+   to the Mac file (a trailing newline is fine).
+2. `cp env.example .env`; set `CPU_RUNNER_API=` to the `api-url` output from step 0; adjust concurrency/limits.
 3. `docker compose up -d --build`
 4. `docker compose run --rm cpu-runner selftest` -> must print PASS. Then `docker logs -f dispatch-cpu-runner`
    should show `start ... isolation: [unshare,...]`.
-Unraid macvlan/bridge: the container needs to reach the Mac's port 7684 (default bridge works).
+Unraid macvlan/bridge: the container needs to reach the Mac's port 7684 (default bridge works). macOS may ask
+once to allow incoming connections for python (allow). Verify on the Mac: `python3 ~/bin/cpu_lane.py summary`
+shows the runner under `runners` (seen_s_ago < 120) and the dashboard "CPU lane" section reads "1 runner(s) online".
+Until a runner has polled in the last 120 s, `run_cpu_stage` runs every stage locally (no 3-minute claim wait).
 
-## Queue API contract (queue side must implement; reference: `reference/queue_server.py`)
+## Queue side (implemented in `~/bin`, mirrored in machine-config `bin/` + `docs/cpu-lane.md`)
+- `cpu_lane.py`: sqlite WAL store `~/.ollama-dispatch/cpu-jobs/jobs.sqlite` + blobs on disk (rows pruned after 7 d,
+  blobs of finished jobs after 1 d), lease reaper thread (10 s tick, also on every claim), token handling,
+  `outstanding_by_bundle()`, `lan_ip()`.
+- `ollama-queue-api.py`: `/api/cpu/*` routes (own bearer token, constant-time compare; requests with Cloudflare /
+  proxy headers or a public Host are refused with 403 even with a valid token), read-only `/api/cpu-lane` feed and
+  the dashboard "CPU lane" section.
+- `ollama-queue.py`: a bundle waiting only on a CPU stage (remote job or local marker) is `waiting`, so the GPU
+  commitment is released to other bundles and the bundle resumes first when the result lands.
+- `cpu_dispatch.py` `run_cpu_stage(worktree, cmd, timeout_s, stage, bundle_id, lockfile_hash=None, tools=None)`.
+- Tests: `tests/test_queue_integration.py` (real agent + real API + wrapper; isolation `none` for the test only),
+  `~/bin/test-cpu-lane-api.py`, `~/bin/test-cpu-lane-queue.py` (canary seams `cpuapi`, `cpulane`).
+
+## Queue API contract (reference: `reference/queue_server.py`)
 All under `/api/cpu/`, header `Authorization: Bearer <token>` (token from file; compare constant-time;
 `GET health` is unauthenticated). Add a CORS-less, Access-bypassed LAN path: ollama-queue-api.py currently
 trusts every request because Cloudflare Access fronts it; these routes must check the token themselves.
@@ -104,8 +128,8 @@ Runner (agent):
 - `POST jobs/<id>/release` `{runner_id, lease_token}` -> job back to `pending`
 - Server-side reaper (on every request or timer): `running` with lease_expires < now -> `pending` (attempt kept; at 3 -> `failed_infra`).
 
-Queue integration notes (plan Phase 6): `cpu` row kind lane-less, modelled on `runner`/`gpu_exclusive`;
-`bundle_commit_status` must not count a pending/running cpu row as holding GPU lanes.
+Queue integration (done): CPU jobs are not queue rows at all, so they never occupy a lane; what used to hold the
+GPU was the bundle commitment, which now yields to a bundle that only waits on a CPU stage (see "Queue side").
 
 ## Client / integration points
     from cpu_job import submit_cpu_job

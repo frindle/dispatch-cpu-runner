@@ -152,12 +152,13 @@ def run_local(worktree, cmd, timeout_s, cwd_rel=None, env=None, tail_bytes=65536
 
 def submit_cpu_job(worktree_path, cmd, timeout_s=600, *, cwd_rel=None, env=None, stage=None, label=None,
                    bundle_id=None, tools=None, mode="bundle", api=None, token=None,
-                   claim_timeout_s=180, poll_s=2.0, fallback=True, max_wait_s=None):
+                   claim_timeout_s=180, poll_s=2.0, fallback=True, max_wait_s=None, lockfile_hash=None):
     """Run `cmd` for a worktree on the CPU runner; return CpuJobResult.
 
     claim_timeout_s: if no runner claims the job within this long, cancel and run locally.
     max_wait_s: hard cap waiting for a claimed job (default timeout_s + 600).
     fallback=False raises RuntimeError instead of running locally.
+    lockfile_hash: override the dep-cache key hint (default: sha256 of package-lock.json at cwd_rel).
     """
     api = api or os.environ.get("CPU_RUNNER_API")
     tok = _token(token)
@@ -179,7 +180,8 @@ def submit_cpu_job(worktree_path, cmd, timeout_s=600, *, cwd_rel=None, env=None,
             return fb("health http %s" % code)
         payload, patch, kind = make_payload(worktree_path, mode)
         lock = os.path.join(worktree_path, cwd_rel or ".", "package-lock.json")
-        lock_hash = hashlib.sha256(open(lock, "rb").read()).hexdigest()[:24] if os.path.exists(lock) else None
+        lock_hash = lockfile_hash or (
+            hashlib.sha256(open(lock, "rb").read()).hexdigest()[:24] if os.path.exists(lock) else None)
         spec = {"cmd": cmd, "cwd": cwd_rel or ".", "timeout_s": int(timeout_s), "env": env or {},
                 "payload_kind": kind, "lockfile_hash": lock_hash, "stage": stage, "network": "none"}
         code, body = _http(api, tok, "POST", "/api/cpu/jobs",
