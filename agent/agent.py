@@ -270,7 +270,9 @@ def probe_isolation(cfg):
     a command inside it that must see only 'lo'."""
     if cfg.isolation == "none":
         return None
-    check = ["sh", "-c", "ls /sys/class/net | tr '\\n' ' '"]
+    # /proc/net/dev follows the CALLING process's netns; /sys/class/net stays bound to the netns sysfs was
+    # mounted in (the container's), so it lists eth0 even inside a fresh empty netns.
+    check = ["sh", "-c", "awk 'NR>2{sub(/:.*/,\"\",$1); print $1}' /proc/net/dev | tr '\\n' ' '"]
     for flags in (NET_FLAGS_FULL, NET_FLAGS_MIN):
         try:
             r = subprocess.run(isolation_prefix(cfg, flags) + check, capture_output=True,
@@ -842,7 +844,7 @@ def selftest_run(cfg):
     script = ("import socket,os,sys\n"
               "r={}\n"
               "r['uid']=os.getuid()\n"
-              "r['ifaces']=sorted(os.listdir('/sys/class/net'))\n"
+              "r['ifaces']=sorted(l.split(':')[0].strip() for l in open('/proc/net/dev').read().splitlines()[2:])\n"
               "for host in ('1.1.1.1','10.0.0.1'):\n"
               "  try: socket.create_connection((host,53),3); r[host]='REACHABLE'\n"
               "  except OSError as e: r[host]='blocked'\n"
