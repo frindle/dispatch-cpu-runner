@@ -1,0 +1,29 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>dispatch-cpu-runner</Name>
+  <Repository>ghcr.io/frindle/dispatch-cpu-runner:latest</Repository>
+  <Registry>https://github.com/frindle/dispatch-cpu-runner/pkgs/container/dispatch-cpu-runner</Registry>
+  <Network>br0</Network>
+  <MyIP>10.0.12.52</MyIP>
+  <Shell>bash</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/frindle/dispatch-cpu-runner/issues</Support>
+  <Project>https://github.com/frindle/dispatch-cpu-runner</Project>
+  <Overview>Pull-based CPU job runner. It polls a job-queue API on your LAN, runs each job (verify/test/mutation commands) in an empty network namespace as an unprivileged user, and posts the result back. First start: paste the queue API URL and a single-use enrollment code; the container fetches and stores its own token. Fixed LAN identity via br0 (IP in the Network field, MAC in Extra Parameters).</Overview>
+  <Category>Tools: Other:</Category>
+  <WebUI/>
+  <TemplateURL>https://raw.githubusercontent.com/frindle/dispatch-cpu-runner/main/unraid/dispatch-cpu-runner.xml</TemplateURL>
+  <Icon>https://raw.githubusercontent.com/frindle/dispatch-cpu-runner/main/unraid/icon.png</Icon>
+  <ExtraParams>--restart=unless-stopped --init --stop-timeout=45 --mac-address=02:70:0A:00:0C:34 --cpus=8 --memory=16g --memory-swap=16g --pids-limit=4096 --cap-drop=ALL --cap-add=SYS_ADMIN --cap-add=NET_ADMIN --cap-add=SETUID --cap-add=SETGID --cap-add=SETPCAP --cap-add=CHOWN --cap-add=DAC_OVERRIDE --cap-add=FOWNER --cap-add=KILL --log-opt max-size=20m --log-opt max-file=3</ExtraParams>
+  <PostArgs/>
+  <CPUset/>
+  <DateInstalled/>
+  <Config Name="Queue API URL" Target="CPU_RUNNER_API" Default="http://CHANGE-ME-QUEUE-HOST-LAN-IP:7684" Mode="" Description="LAN URL of the job-queue API, printed by `cpu_lane.py enroll-code` on the queue host. Use the host's LAN IP, not a public hostname." Type="Variable" Display="always" Required="true" Mask="false"/>
+  <Config Name="Enrollment code (first start)" Target="CPU_RUNNER_ENROLL_CODE" Default="" Mode="" Description="Single-use code (valid 1 hour) from `cpu_lane.py enroll-code`. Only needed once, or after a token rotation; the token is stored in the state path below. May be left empty afterwards." Type="Variable" Display="always" Required="false" Mask="true"/>
+  <Config Name="Token (fallback)" Target="CPU_RUNNER_TOKEN" Default="" Mode="" Description="Optional: paste the shared token directly instead of enrolling. Leave empty normally." Type="Variable" Display="advanced" Required="false" Mask="true"/>
+  <Config Name="Runner ID" Target="CPU_RUNNER_ID" Default="unraid-cpu-1" Mode="" Description="Name shown on the queue dashboard." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="Isolation" Target="CPU_RUNNER_ISOLATION" Default="required" Mode="" Description="required (fail closed, default), auto, or none. Leave on required." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="Concurrency (override)" Target="CPU_RUNNER_CONCURRENCY" Default="" Mode="" Description="Leave empty to use the value configured on the queue (cpu_lane.py config concurrency=N). Setting it here overrides." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="State (stored token)" Target="/state" Default="/mnt/user/appdata/dispatch-cpu-runner/state" Mode="rw" Description="Holds the enrolled token (0600). Keep private." Type="Path" Display="advanced" Required="true" Mask="false">/mnt/user/appdata/dispatch-cpu-runner/state</Config>
+  <Config Name="Dependency cache" Target="/cache" Default="/mnt/user/appdata/dispatch-cpu-runner/cache" Mode="rw" Description="Persistent npm and node_modules caches." Type="Path" Display="advanced" Required="true" Mask="false">/mnt/user/appdata/dispatch-cpu-runner/cache</Config>
+</Container>

@@ -4,108 +4,6 @@ import json, os, shutil, subprocess, sys, tempfile, threading, time, unittest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from test_e2e import Base, ROOT, TOKEN  # noqa: E402
 
-PROV = os.path.join(ROOT, "scripts", "provision.sh")
-
-
-def prov(share, token_src, api="http://10.9.8.7:7684", **extra):
-    e = dict(os.environ, CPU_RUNNER_SHARE=share, CPU_RUNNER_TOKEN_SRC=token_src, CPU_RUNNER_API_URL=api)
-    e.update(extra)
-    return subprocess.run(["bash", PROV], env=e, capture_output=True, text=True)
-
-
-@unittest.skipUnless(shutil.which("rsync"), "rsync not installed (provision.sh needs it; the Mac has it)")
-class TestProvision(unittest.TestCase):
-    def setUp(self):
-        self.td = tempfile.mkdtemp(prefix="cpurunner-test-")
-        self.share = os.path.join(self.td, "data", "dispatch-cpu-runner")
-        self.tok = os.path.join(self.td, "cfg", "token")
-        os.makedirs(os.path.dirname(self.tok)); os.makedirs(os.path.dirname(self.share))
-        open(self.tok, "w").write("s3cr3t-token-value-0123456789abcdef\n")
-        os.chmod(self.tok, 0o600)
-
-    def tearDown(self):
-        shutil.rmtree(self.td, ignore_errors=True)
-
-    def rd(self, *p):
-        return open(os.path.join(self.share, *p)).read()
-
-    def test_fresh_provision_and_token_never_printed(self):
-        r = prov(self.share, self.tok)
-        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
-        self.assertNotIn("s3cr3t", r.stdout + r.stderr)
-        self.assertEqual(self.rd("secrets", "token"), open(self.tok).read())
-        self.assertEqual(oct(os.stat(os.path.join(self.share, "secrets", "token")).st_mode & 0o777), "0o600")
-        self.assertIn("CPU_RUNNER_API=http://10.9.8.7:7684", self.rd(".env"))
-        self.assertNotIn("<MAC-LAN-IP>", self.rd(".env"))
-        self.assertTrue(os.path.isdir(os.path.join(self.share, "cache")))
-        for f in ("agent/agent.py", "Dockerfile", "docker-compose.yml", "deploy.sh", "update.sh"):
-            self.assertTrue(os.path.exists(os.path.join(self.share, f)), f)
-        for bad in ("tests", ".git", "__pycache__"):
-            self.assertFalse(os.path.exists(os.path.join(self.share, bad)), bad)
-        self.assertIn("REDEPLOY_NEEDED", r.stdout)
-
-    def test_idempotent_and_env_refresh_keeps_user_settings(self):
-        self.assertEqual(prov(self.share, self.tok).returncode, 0)
-        env_p = os.path.join(self.share, ".env")
-        s = open(env_p).read().replace("CPU_RUNNER_CONCURRENCY=2", "CPU_RUNNER_CONCURRENCY=5") + "MY_KEY=keepme\n"
-        open(env_p, "w").write(s)
-        tok_mtime = os.stat(os.path.join(self.share, "secrets", "token")).st_mtime_ns
-        r = prov(self.share, self.tok)                        # same IP: nothing changes
-        self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(open(env_p).read(), s)
-        self.assertIn("already current", r.stdout)
-        self.assertEqual(os.stat(os.path.join(self.share, "secrets", "token")).st_mtime_ns, tok_mtime)
-        r = prov(self.share, self.tok, api="http://10.1.2.3:7684")   # Mac IP changed: only that key moves
-        self.assertEqual(r.returncode, 0, r.stderr)
-        new = open(env_p).read()
-        self.assertEqual(new, s.replace("10.9.8.7", "10.1.2.3"))
-        self.assertIn("CPU_RUNNER_CONCURRENCY=5", new); self.assertIn("MY_KEY=keepme", new)
-
-    def test_token_rotation_and_creation(self):
-        self.assertEqual(prov(self.share, self.tok).returncode, 0)
-        open(self.tok, "w").write("rotated-token-value\n")
-        self.assertEqual(prov(self.share, self.tok).returncode, 0)
-        self.assertEqual(self.rd("secrets", "token"), "rotated-token-value\n")
-        missing = os.path.join(self.td, "new", "token")        # absent Mac token is created, 64 hex
-        r = prov(self.share, missing)
-        self.assertEqual(r.returncode, 0, r.stderr)
-        t = open(missing).read().strip()
-        self.assertEqual(len(t), 64); int(t, 16)
-        self.assertNotIn(t, r.stdout + r.stderr)
-        self.assertEqual(self.rd("secrets", "token").strip(), t)
-
-    def test_delete_only_in_managed_dirs_and_user_files_survive(self):
-        self.assertEqual(prov(self.share, self.tok).returncode, 0)
-        open(os.path.join(self.share, "agent", "stale.py"), "w").write("x")       # managed dir: removed
-        open(os.path.join(self.share, "docker-compose.override.yml"), "w").write("keep")  # user file: kept
-        open(os.path.join(self.share, "cache", "blob"), "w").write("keep")
-        self.assertEqual(prov(self.share, self.tok).returncode, 0)
-        self.assertFalse(os.path.exists(os.path.join(self.share, "agent", "stale.py")))
-        self.assertTrue(os.path.exists(os.path.join(self.share, "docker-compose.override.yml")))
-        self.assertTrue(os.path.exists(os.path.join(self.share, "cache", "blob")))
-
-    def test_redeploy_flag_follows_stamp(self):
-        self.assertEqual(prov(self.share, self.tok).returncode, 0)
-        h = subprocess.run("cat Dockerfile docker-compose.yml .env | shasum -a 256 2>/dev/null || "
-                           "cat Dockerfile docker-compose.yml .env | sha256sum", shell=True, cwd=self.share,
-                           capture_output=True, text=True).stdout[:16]
-        open(os.path.join(self.share, ".deployed-stamp"), "w").write(h + "\n")
-        r = prov(self.share, self.tok)
-        self.assertIn("NO_REDEPLOY_NEEDED", r.stdout)
-        open(os.path.join(self.share, "Dockerfile"), "a").write("# changed\n")   # next sync restores it -> differs from stamp? no:
-        r = prov(self.share, self.tok)                                            # sync overwrites; stamp matches again
-        self.assertIn("NO_REDEPLOY_NEEDED", r.stdout)
-        r = prov(self.share, self.tok, api="http://10.5.5.5:7684")                # .env changed -> redeploy
-        self.assertIn("REDEPLOY_NEEDED", r.stdout)
-
-    def test_unmounted_volume_refused(self):
-        r = prov("/Volumes/definitely-not-mounted-xyz/dispatch-cpu-runner", self.tok)
-        self.assertNotEqual(r.returncode, 0)
-        self.assertIn("not mounted", r.stderr)
-        self.assertFalse(os.path.exists("/Volumes/definitely-not-mounted-xyz"))
-
-    def test_bad_api_url_rejected(self):
-        self.assertNotEqual(prov(self.share, self.tok, api="http://<mac-lan-ip>:7684").returncode, 0)
 
 
 class TestAgentToken(Base):
@@ -113,13 +11,13 @@ class TestAgentToken(Base):
         p = self.start_agent(CPU_RUNNER_TOKEN="", CPU_RUNNER_TOKEN_FILE=os.path.join(self.td, "nope"))
         out = p.communicate(timeout=20)[0]
         self.assertEqual(p.returncode, 4)
-        self.assertIn("scripts/provision.sh", out)
+        self.assertIn("CPU_RUNNER_ENROLL_CODE", out)
 
     def test_empty_token_file_exits(self):
         f = os.path.join(self.td, "tok"); open(f, "w").write("\n")
         p = self.start_agent(CPU_RUNNER_TOKEN="", CPU_RUNNER_TOKEN_FILE=f)
         out = p.communicate(timeout=20)[0]
-        self.assertEqual(p.returncode, 4); self.assertIn("scripts/provision.sh", out)
+        self.assertEqual(p.returncode, 4); self.assertIn("CPU_RUNNER_ENROLL_CODE", out)
 
     def test_token_from_file_accepted_and_preflight_logged(self):
         f = os.path.join(self.td, "tok"); open(f, "w").write(TOKEN + "\n")
@@ -153,7 +51,7 @@ class TestAgentToken(Base):
         hc = subprocess.run([sys.executable, os.path.join(ROOT, "agent", "agent.py"), "healthcheck"], env=e)
         self.assertEqual(hc.returncode, 1)
         p.terminate(); out = p.communicate(timeout=20)[0]
-        self.assertIn("token_rejected", out); self.assertIn("provision.sh", out)
+        self.assertIn("token_rejected", out); self.assertIn("enroll-code", out)
 
     def start_agent(self, **over):
         over.setdefault("CPU_RUNNER_STATUS_FILE", os.path.join(self.td, "status"))
@@ -242,25 +140,100 @@ class TestReload(Base):
         self.assertIn(job["status"], ("pending", "cancelled"), "".join(self.lines[-8:]))       # released, not lost
 
 
+class TestEnroll(Base):
+    """First start trades a single-use code for the token (stored 0600 in the state dir); later starts reuse it."""
+
+    def agent(self, code="", **over):
+        over.setdefault("CPU_RUNNER_STATE_DIR", os.path.join(self.td, "state"))
+        over.setdefault("CPU_RUNNER_STATUS_FILE", os.path.join(self.td, "status"))
+        return self.start_agent(CPU_RUNNER_TOKEN="", CPU_RUNNER_ENROLL_CODE=code, **over)
+
+    def wait_status(self, want, secs=15):
+        st = os.path.join(self.td, "status")
+        for _ in range(int(secs * 10)):
+            time.sleep(0.1)
+            try:
+                if json.load(open(st)).get("api") == want:
+                    return True
+            except Exception:
+                pass
+        return False
+
+    def test_enroll_stores_token_and_later_starts_need_no_code(self):
+        self.store.codes.add("code-one-AAAA")
+        p = self.agent("code-one-AAAA")
+        self.assertTrue(self.wait_status("ok"))
+        tf = os.path.join(self.td, "state", "token")
+        self.assertEqual(open(tf).read().strip(), TOKEN)
+        self.assertEqual(oct(os.stat(tf).st_mode & 0o777), "0o600")
+        self.assertEqual(self.store.enrolled, ["r0"])
+        p.terminate(); out = p.communicate(timeout=20)[0]
+        self.assertNotIn(TOKEN, out); self.assertNotIn("code-one-AAAA", out)
+        self.assertEqual(self.store.codes, set())                      # consumed
+        os.remove(os.path.join(self.td, "status"))
+        p2 = self.agent("")                                            # no code any more: stored token is used
+        self.assertTrue(self.wait_status("ok"))
+        self.assertEqual(len(self.store.enrolled), 1)
+        p2.terminate(); p2.communicate(timeout=20)
+
+    def test_bad_code_exits_with_clear_error_and_stores_nothing(self):
+        p = self.agent("not-a-real-code", CPU_RUNNER_API=self.api)
+        out = p.communicate(timeout=60)[0]
+        self.assertEqual(p.returncode, 4)
+        self.assertIn("enroll_failed", out); self.assertIn("enroll-code", out)
+        self.assertFalse(os.path.exists(os.path.join(self.td, "state", "token")))
+
+    def test_rotated_token_is_replaced_when_a_fresh_code_is_configured(self):
+        self.store.codes.add("code-one-AAAA")
+        p = self.agent("code-one-AAAA")
+        self.assertTrue(self.wait_status("ok"))
+        p.terminate(); p.communicate(timeout=20)
+        self.store.token = "rotated-token-2"; self.store.codes.add("code-two-BBBB")
+        os.remove(os.path.join(self.td, "status"))
+        p2 = self.agent("code-two-BBBB")
+        self.assertTrue(self.wait_status("ok"))
+        self.assertEqual(open(os.path.join(self.td, "state", "token")).read().strip(), "rotated-token-2")
+        p2.terminate(); out = p2.communicate(timeout=20)[0]
+        self.assertIn("reenrolled", out)
+
+    def test_rotated_token_without_fresh_code_reports_clearly_and_is_unhealthy(self):
+        self.store.codes.add("code-one-AAAA")
+        p = self.agent("code-one-AAAA")
+        self.assertTrue(self.wait_status("ok"))
+        p.terminate(); p.communicate(timeout=20)
+        self.store.token = "rotated-token-2"
+        os.remove(os.path.join(self.td, "status"))
+        p2 = self.agent("")
+        self.assertTrue(self.wait_status("token_rejected"))
+        p2.terminate(); out = p2.communicate(timeout=20)[0]
+        self.assertIn("token_rejected", out); self.assertIn("enroll-code", out)
+
+    def test_pasted_token_env_still_works(self):
+        p = self.start_agent(CPU_RUNNER_STATE_DIR=os.path.join(self.td, "state"),
+                             CPU_RUNNER_STATUS_FILE=os.path.join(self.td, "status"))
+        self.assertTrue(self.wait_status("ok"))
+        self.assertFalse(os.path.exists(os.path.join(self.td, "state", "token")))
+        p.terminate(); p.communicate(timeout=20)
+
+    def test_remote_config_applies_but_explicit_env_wins(self):
+        self.store.config = {"concurrency": 3, "lease_s": 45, "isolation": "none", "node_options": "--max-old-space-size=1234"}
+        self.store.codes.add("c-AAAAAAAA")
+        p = self.agent("c-AAAAAAAA", CPU_RUNNER_CONCURRENCY="", CPU_RUNNER_LEASE_S="90")
+        self.assertTrue(self.wait_status("ok"))
+        p.terminate(); out = p.communicate(timeout=20)[0]
+        pulled = [json.loads(l) for l in out.splitlines() if '"config_pulled"' in l][0]["applied"]
+        self.assertEqual(pulled.get("concurrency"), 3)
+        self.assertNotIn("lease_s", pulled)                            # explicit env wins
+        self.assertNotIn("isolation", pulled)                          # never remote
+        start = [json.loads(l) for l in out.splitlines() if '"event": "start"' in l][0]
+        self.assertEqual(start["concurrency"], 3)
+
+
 class TestScripts(unittest.TestCase):
     def test_shell_scripts_parse(self):
-        for f in ("deploy.sh", "update.sh", "scripts/provision.sh"):
+        for f in ("update.sh", "scripts/enroll.sh", "scripts/sandbox-e2e.sh"):
             r = subprocess.run(["bash", "-n", os.path.join(ROOT, f)], capture_output=True, text=True)
             self.assertEqual(r.returncode, 0, f + r.stderr)
-
-    def test_deploy_requires_provisioned_files(self):
-        td = tempfile.mkdtemp(prefix="cpurunner-test-")
-        try:
-            shutil.copy(os.path.join(ROOT, "deploy.sh"), td)
-            fake = os.path.join(td, "fakebin"); os.makedirs(fake)
-            open(os.path.join(fake, "docker"), "w").write("#!/bin/sh\n[ \"$1\" = compose ] && [ \"$2\" = version ] && exit 0\nexit 1\n")
-            os.chmod(os.path.join(fake, "docker"), 0o755)
-            r = subprocess.run(["bash", os.path.join(td, "deploy.sh")], capture_output=True, text=True,
-                               env=dict(os.environ, PATH=fake + os.pathsep + os.environ["PATH"]))
-            self.assertEqual(r.returncode, 1)
-            self.assertIn("scripts/provision.sh on the Mac first", r.stdout)
-        finally:
-            shutil.rmtree(td, ignore_errors=True)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,14 @@
+# Developer override: build the image locally, bind-mount ./agent for hot reload, plain bridge network.
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
+services:
+  cpu-runner:
+    build: .
+    image: dispatch-cpu-runner:dev
+    pull_policy: never
+    mac_address: !reset null
+    networks: !override
+      - default
+    volumes:
+      - ./agent:/opt/runner:ro
+      - ./cache:/cache
+      - cpu-runner-work:/work

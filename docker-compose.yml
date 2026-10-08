@@ -1,21 +1,24 @@
-# Deploy dir on Unraid: /mnt/user/data/dispatch-cpu-runner/   (build context = this dir)
-# Never edit by hand: on the Mac run scripts/provision.sh (secrets/token + .env are generated), then
-# on Unraid run ./deploy.sh. Updates: Mac `update.sh` (agent code is mounted, it self-reloads).
+# Runs the PUBLISHED image (ghcr.io/frindle/dispatch-cpu-runner) with a fixed LAN identity on Unraid's br0 macvlan.
+# Deploy dir on Unraid: /mnt/user/appdata/dispatch-cpu-runner/  (this file, .env with API URL + enrollment code, cache/, state/)
+# Normally you install via the Unraid Docker UI template instead (unraid/dispatch-cpu-runner.xml); this is the equivalent.
+# Dev (build locally, hot-reload the agent from ./agent, plain bridge network): see docker-compose.dev.yml.
 services:
   cpu-runner:
-    build: .
-    image: dispatch-cpu-runner:latest
+    image: ghcr.io/frindle/dispatch-cpu-runner:latest
+    pull_policy: always
     container_name: dispatch-cpu-runner
     restart: unless-stopped
     env_file: .env
     environment:
-      CPU_RUNNER_TOKEN_FILE: /run/secrets/cpu_runner_token
       CPU_RUNNER_ID: unraid-cpu-1
-    secrets: [cpu_runner_token]
     volumes:
-      - ./agent:/opt/runner:ro    # agent code mounted (not baked): update = rsync, agent re-execs itself
-      - ./cache:/cache            # persistent npm + node_modules caches (data share)
-      - cpu-runner-work:/work     # scratch checkouts; named volume (docker img storage), wiped at startup
+      - ./cache:/cache            # persistent npm + node_modules caches
+      - ./state:/state            # the enrolled token lives here (0600); keep it private
+      - cpu-runner-work:/work     # scratch checkouts; named volume, wiped at startup
+    networks:
+      lan:
+        ipv4_address: ${CPU_RUNNER_IP:-10.0.12.52}
+    mac_address: ${CPU_RUNNER_MAC:-02:70:0A:00:0C:34}
     # ---- explicit resource limits (shared by all CPU_RUNNER_CONCURRENCY jobs) ----
     cpus: ${CPU_RUNNER_CPUS:-8}
     mem_limit: ${CPU_RUNNER_MEM:-16g}
@@ -24,15 +27,15 @@ services:
     # ---- privileges: only what the empty-netns + privilege-drop wrapper needs ----
     cap_drop: [ALL]
     cap_add: [SYS_ADMIN, NET_ADMIN, SETUID, SETGID, SETPCAP, CHOWN, DAC_OVERRIDE, FOWNER, KILL]
-    # If the startup selftest cannot create a network namespace run `./deploy.sh --relax-seccomp`
-    # (writes docker-compose.override.yml; this file stays untouched).
+    # If the startup selftest cannot create a network namespace add:  security_opt: ["seccomp=unconfined"]
     stop_grace_period: 45s
     init: true
     logging:
       driver: json-file
       options: {max-size: "20m", max-file: "3"}
-secrets:
-  cpu_runner_token:
-    file: ./secrets/token
+networks:
+  lan:
+    external: true
+    name: br0
 volumes:
   cpu-runner-work:

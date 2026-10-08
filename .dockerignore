@@ -1,0 +1,11 @@
+.git
+.github
+secrets
+.env
+cache
+tests
+reference
+scripts
+unraid
+__pycache__
+*.pyc

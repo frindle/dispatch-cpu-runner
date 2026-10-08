@@ -1,72 +1,92 @@
 # dispatch-cpu-runner
 
-## Deploy in one step
-Mac (once; also what `update.sh` does first): `./update.sh` (or `bash scripts/provision.sh`). It copies the build
-context to `/Volumes/data/dispatch-cpu-runner`, writes `secrets/token` from the Mac's token file (creating that file if absent),
-and writes `.env` with the Mac's LAN URL filled in. No hand-editing, ever.
+A small, security-conscious **CPU job runner** you run as a container. It polls a job-queue API on your LAN, checks the
+job's git bundle out into a scratch dir, installs dependencies (cached), runs the job's command **inside an empty network
+namespace as an unprivileged user** (no network, no capabilities), and posts the exit code and output tails back. Python
+standard library only; Node 22 in the image for JavaScript jobs.
 
-Unraid (web terminal), the only command:
+It is a pull-based worker for a queue **you provide**: it needs a queue API that implements the contract below (a reference
+implementation is in `reference/queue_server.py`) and a shared token that the queue issues to the runner through a one-time
+enrollment code. It is not useful on its own.
 
-    cd /mnt/user/data/dispatch-cpu-runner && bash deploy.sh
+Image: `ghcr.io/frindle/dispatch-cpu-runner:latest` (linux/amd64, linux/arm64; also `:<short-sha>` and `:vX.Y.Z` tags). The
+agent code is baked into the image, so updating the container updates the agent.
 
-`deploy.sh` checks docker/compose, verifies `secrets/token` and `.env` exist (else it says to run provision on the Mac), builds,
-starts, waits for the container to be healthy, runs the isolation selftest, and prints a PASS/FAIL summary (isolation, queue
-API reachable, token accepted). If namespace creation fails it tells you to run `bash deploy.sh --relax-seccomp` (adds
-`docker-compose.override.yml` with `seccomp=unconfined`; the main compose is never edited). The container also runs the selftest and an
-API/token check by itself at every start (see `docker logs dispatch-cpu-runner`: events `selftest`, `api_ok` / `token_rejected`),
-and the Docker healthcheck goes unhealthy if the selftest failed or the token is rejected.
-Missing token inside the container: it exits with a one-line pointer to `scripts/provision.sh` (it never invents a token).
+## Install from the Unraid Docker UI
+Prerequisite: the queue API is reachable from Unraid at `http://<queue-host-lan-ip>:7684`.
 
-## Update in one step
-Mac: `./update.sh`. It re-runs provision (rsync of the latest code; refreshes only `CPU_RUNNER_API` in `.env` if the Mac IP
-changed). The agent code is **bind-mounted** (`./agent:/opt/runner:ro`), not baked into the image: the running agent
-hashes its own file, and on a change that compiles it stops claiming, lets leased jobs finish (heartbeats continue; after
-`CPU_RUNNER_RELOAD_GRACE_S`=1800 s leftovers are released back to the queue), then re-execs itself. Zero downtime, no Unraid step.
-Only when `Dockerfile`, `docker-compose.yml` or `.env` changed does `update.sh` print `REBUILD NEEDED` with the single
-command to run on Unraid (`bash deploy.sh`, idempotent, same as deploy). `./update.sh --restart` additionally restarts the container via
-the Unraid GraphQL API (key read from `~/.claude.json`, never printed; it does not apply compose/.env changes).
-Why not a rebuilding sidecar: that needs the docker socket (= root on the host), which we deliberately do not mount.
+1. **On the queue host** mint an enrollment code and note the API URL it prints (`cpu_lane.py` is the queue-side module of the
+   maintainer's own queue; the enroll and config endpoints are specified in "Queue API contract" if you write your own):
 
-### Security model
-- The shared token lives in `~/.config/dispatch-cpu-runner/token` (0600) on the Mac and `secrets/token` (0600) on the data share;
-  mounted into the container as a compose secret file. It is never in git (`secrets/`, `.env` are gitignored), never in `.env`,
-  never printed by the scripts (they print sizes/modes only), and jobs never see it (clean job environment).
-- The data share is reachable by anyone with access to that SMB share: keep the `data` share private (not public/guest) since it holds the token.
-  Rotating: delete the Mac token file, run `update.sh` (a new one is created and copied), then `bash deploy.sh` or `./update.sh --restart`.
-- The queue API is LAN-only: `/api/cpu/*` rejects proxied/Cloudflare requests and checks the bearer token itself; the container
-  calls out to the Mac's LAN IP:7684, nothing listens on Unraid. No docker socket is mounted.
-- Isolation stays fail-closed (`CPU_RUNNER_ISOLATION=required`).
+       python3 ~/bin/cpu_lane.py enroll-code        # or: scripts/enroll.sh
+       CPU_RUNNER_API=http://<queue-host-lan-ip>:7684
+       CPU_RUNNER_ENROLL_CODE=...                     # single use, valid 1 hour
 
-Purpose-built Unraid container that runs the dispatch pipeline's CPU-only stages
-(baseline/final verify, preflight both-ways verify, relevance mutation, harness
-self-check, slicer scaffolding) so they stop idling the GPU lanes. Phase 6 of
-`~/.claude/plans/so-i-m-getting-really-tender-tiger.md`. Not claude-sandbox (testing only).
+2. **In Unraid**: Docker tab > Add Container. Easiest: Settings > Docker (advanced view) > *Template repositories*, add
+   `https://github.com/frindle/dispatch-cpu-runner`, then Add Container and pick **dispatch-cpu-runner**. (Or paste
+   `unraid/dispatch-cpu-runner.xml` into `/boot/config/plugins/dockerMan/templates-user/`, or fill the form by hand with
+   the repository `ghcr.io/frindle/dispatch-cpu-runner:latest`.)
+3. Paste **Queue API URL** and **Enrollment code**. Check Network Type `br0`, Fixed IP `10.0.12.52` (template default) and
+   that Extra Parameters contains `--mac-address=02:70:0A:00:0C:34`. Apply.
+4. On first start the container exchanges the code for the shared token over the LAN and stores it at
+   `/mnt/user/appdata/dispatch-cpu-runner/state/token` (0600). You can now clear the code field. Check
+   `docker logs dispatch-cpu-runner` for `enrolled`, `selftest ... PASS`, `api_ok`, and `python3 ~/bin/cpu_lane.py summary`
+   on the queue host for the runner.
 
-Pull-based: the container polls the queue API over the LAN; the Mac never needs to
-reach into Unraid (Unraid has no SSH). Python stdlib only; Node 22 in the image for jobs.
+Paths on Unraid: `/mnt/user/appdata/dispatch-cpu-runner/{state,cache}`. Nothing else is needed on Unraid; there is no file
+push from the queue host. Equivalent compose file: `docker-compose.yml` + `.env` (see `env.example`) in the same directory.
 
-## Status
-Built and tested (agent, client, reference queue). **Queue side is implemented** (2026-10-08) in
-`~/bin/cpu_lane.py` + `~/bin/ollama-queue-api.py` (see "Queue side"), with `~/bin/cpu_dispatch.py`
-as the stage-facing wrapper; stages are NOT wired in yet. Real network-namespace
-isolation can only be proven inside the container (`selftest`), see "Isolation".
+### Network identity (fixed IP and MAC)
+Containers here normally use the default bridge; this one is a deliberate exception so the firewall/router sees a stable
+device: IP **10.0.12.52** on Unraid's `br0` macvlan, MAC **02:70:0A:00:0C:34** (locally administered; the last four octets
+encode the IP). If your router quarantines unknown MACs or hands out reservations, allow/reserve that MAC. Macvlan caveat: a
+macvlan container cannot talk to the Unraid host itself, only to other LAN hosts (the queue API is on another host, so this
+is fine).
 
-## Sizing (Unraid GraphQL, 2026-10-08)
-- CPU: Intel Xeon E5-2699 v4, 44 cores / 88 threads, ~10% utilised.
-- RAM: 256 GiB installed (4x64 GiB), ~190-204 GiB available (cache included); 37 containers, 34 running.
-  Penn is freeing more memory.
-- Defaults: **2 runners** (`CPU_RUNNER_CONCURRENCY`), container limit **8 CPUs / 16 GiB** (`CPU_RUNNER_CPUS`,
-  `CPU_RUNNER_MEM`) = ~4 CPU / 8 GiB per job; `NODE_OPTIONS=--max-old-space-size` set per job.
-  Median relevance run is 4 s, TS mutants ~72 s, verify <=300 s; 2 slots cover a bundle. Scale by
-  raising the three numbers together (e.g. 4 / 16 / 32g). Jobs are `nice`d (5).
+### Update
+Unraid Docker tab > *Check for updates* > *Apply update* (pulls the new public image, recreates from the template; token
+and cache persist). From the queue host: `./update.sh --restart` does the same through the Unraid GraphQL API
+(`--dry-run` shows what it would do). Development override: `docker-compose.dev.yml` builds locally and bind-mounts
+`./agent` for hot reload (the agent re-execs itself when its file changes).
+
+### Re-enroll / rotate the token
+On the queue host: `scripts/enroll.sh --rotate` (rotates the shared token: every runner now gets 401, then mints a code).
+Put the new code in the container's *Enrollment code* field and apply. On start the stored (now rejected) token is replaced
+automatically. With no fresh code the container logs `token_rejected` with the exact command to run and reports unhealthy.
+A pasted `CPU_RUNNER_TOKEN` is a fallback only; it is never rotated for you.
+
+### Settings pulled from the queue
+`concurrency`, `lease_s`, `max_job_timeout_s`, `cache_max_entries` and `node_options` are pulled from `GET /api/cpu/config`
+at start (queue host: `python3 ~/bin/cpu_lane.py config concurrency=3`, applied on next container start). Any env var
+set on the container wins, and isolation is never remote. Container limits (`--cpus=8 --memory=16g`, in Extra Parameters)
+bound the total; defaults are 2 runners, about 4 CPU / 8 GiB each.
+
+## Security
+- **The token** is the one secret. It is never in the image, the template, git or logs. It reaches the container over the
+  LAN once via a single-use, one-hour code (stored hashed on the queue side, constant-time compared, failures rate limited
+  and slowed, requests that look proxied or CDN-fronted are refused) and is stored 0600 in the container's state volume.
+  Protect `/mnt/user/appdata/dispatch-cpu-runner/state` like a password file. Jobs never see it (clean job environment).
+- The enrollment endpoint sends the token in plaintext HTTP on your LAN; do not enroll over an untrusted network. Use
+  `--rotate` if a code or token might have leaked.
+- Job code runs with no network (empty netns, loopback only) as uid 10001 with an empty capability set and
+  `no-new-privs`. `CPU_RUNNER_ISOLATION=required` (default) makes the agent refuse to start if it cannot prove the
+  isolation (startup selftest). No docker socket is mounted.
+- The container keeps only `SYS_ADMIN NET_ADMIN SETUID SETGID SETPCAP CHOWN DAC_OVERRIDE FOWNER KILL` (everything else
+  dropped), to create the namespace and drop privileges. `SYS_ADMIN` is broad: the safety rests on the wrapper dropping
+  everything before job code runs. If namespace creation fails, add `--security-opt seccomp=unconfined`.
+- The queue API must be LAN-only and enforce the token itself.
+
+## Sizing
+Defaults: 2 concurrent jobs, container limit 8 CPUs / 16 GiB, `NODE_OPTIONS=--max-old-space-size` per job, jobs `nice`d (5).
+Scale by raising concurrency, `--cpus` and `--memory` together.
 
 ## Layout
-- `agent/agent.py` the runner (claim loop x N threads, heartbeat, deps cache, isolation, results)
+- `agent/agent.py` the runner (claim loop x N threads, heartbeat, deps cache, isolation, enrollment, results)
 - `client/cpu_job.py` `submit_cpu_job(...)` for the queue side (+ local fallback)
-- `reference/queue_server.py` in-memory reference implementation of the API (port this into the queue)
-- `tests/test_e2e.py` 14 tests + `tests/test_deploy.py` (provision idempotency, token never printed, .env refresh, token handling, self-reload without dropping a job); `scripts/sandbox-e2e.sh` runs them on claude-sandbox and cleans up
-- `scripts/provision.sh` (Mac sync + secrets + .env), `update.sh` (Mac), `deploy.sh` (Unraid), `scripts/unraid_restart.py`
-- `Dockerfile`, `docker-compose.yml`, `env.example`
+- `reference/queue_server.py` in-memory reference implementation of the API
+- `tests/` unit and end-to-end tests (`python3 -W ignore -m unittest discover -s tests`)
+- `scripts/enroll.sh` (queue host: mint code / rotate token), `update.sh` + `scripts/unraid_restart.py` (optional Unraid GraphQL update)
+- `Dockerfile`, `docker-compose.yml`, `docker-compose.dev.yml`, `env.example`, `unraid/dispatch-cpu-runner.xml` (+ `icon.png`)
 
 ## Design
 Per job: claim (lease) -> download bundle/patch/tools -> `git clone` bundle into a fresh tmp dir
@@ -77,9 +97,9 @@ group on timeout -> POST exit code, stdout/stderr tails (64 KB), timings.
 - **Shipping**: `git bundle create HEAD` (full history, default) or `mode="archive"` (tree only, much
   smaller; a throwaway git repo with one commit is created on the runner). Dirty + untracked
   (non-ignored) files travel as `git diff --binary` built from a temporary index: the worktree's real
-  index is never touched. Extra helper scripts (e.g. `verify-relevance.py` from `~/bin`) go in
+  index is never touched. Extra helper scripts (e.g. `verify-relevance.py` from a tools dir) go in
   `tools={name: path}` and appear in `$JOB_TOOLS`.
-- **Dep cache** (`/cache`, bind-mounted from the data share): key = sha256(package-lock.json +
+- **Dep cache** (`/cache`, bind-mounted from appdata): key = sha256(package-lock.json +
   package.json + prisma/schema.prisma + node major + arch). Miss: `npm ci --prefer-offline` (+ `prisma generate`
   if prisma is a dependency, network allowed in this phase only), then `cp -a node_modules` into the cache.
   Hit: `cp -a` from the cache. Shared npm cache at `/cache/npm`. Per-key flock so concurrent runners don't
@@ -106,35 +126,14 @@ containers. Chosen over `docker run --network none` per job (needs the docker so
 `CPU_RUNNER_ISOLATION=required` (default) makes the agent probe at startup and **refuse to start (exit 3)**
 if the wrapper does not produce a namespace containing only `lo`. `selftest` asserts: only `lo`, 1.1.1.1 and a LAN IP
 unreachable, DNS fails, loopback bind works, uid != 0, CapEff = 0.
-**Verification status**: claude-sandbox is itself a container whose seccomp blocks `unshare`, so only the
-fail-closed behaviour and command shape were tested there. The container runs `selftest` itself at start (and `deploy.sh` re-runs it).
-Troubleshooting: if it cannot create a namespace, run `bash deploy.sh --relax-seccomp`.
+**Verification status**: A CI/dev sandbox container whose seccomp blocks `unshare` could only test the
+fail-closed behaviour and command shape; the real namespace is proven by the `selftest` the container runs at every start.
+Troubleshooting: if it cannot create a namespace, add `--security-opt seccomp=unconfined` to Extra Parameters (compose: `security_opt`).
 The dependency-install phase has network (it must) and runs as the unprivileged user.
 
-## Operations notes
-The Mac queue API (dashboard, :7684) must have been restarted once so it serves `/api/cpu/*`; check from any LAN host:
-`curl http://<mac-lan-ip>:7684/api/cpu/health` -> `{"ok": true}`. macOS may ask once to allow incoming connections for python (allow).
-Verify on the Mac: `python3 ~/bin/cpu_lane.py summary` shows the runner under `runners` (seen_s_ago < 120) and the dashboard
-"CPU lane" section reads "1 runner(s) online". Until a runner has polled in the last 120 s, `run_cpu_stage` runs every stage locally.
-Mac mount: `provision.sh` refuses to write if `/Volumes/data` is not a mounted share (Finder > Connect to Server > smb://<unraid>/data).
-
-## Queue side (implemented in `~/bin`, mirrored in machine-config `bin/` + `docs/cpu-lane.md`)
-- `cpu_lane.py`: sqlite WAL store `~/.ollama-dispatch/cpu-jobs/jobs.sqlite` + blobs on disk (rows pruned after 7 d,
-  blobs of finished jobs after 1 d), lease reaper thread (10 s tick, also on every claim), token handling,
-  `outstanding_by_bundle()`, `lan_ip()`.
-- `ollama-queue-api.py`: `/api/cpu/*` routes (own bearer token, constant-time compare; requests with Cloudflare /
-  proxy headers or a public Host are refused with 403 even with a valid token), read-only `/api/cpu-lane` feed and
-  the dashboard "CPU lane" section.
-- `ollama-queue.py`: a bundle waiting only on a CPU stage (remote job or local marker) is `waiting`, so the GPU
-  commitment is released to other bundles and the bundle resumes first when the result lands.
-- `cpu_dispatch.py` `run_cpu_stage(worktree, cmd, timeout_s, stage, bundle_id, lockfile_hash=None, tools=None)`.
-- Tests: `tests/test_queue_integration.py` (real agent + real API + wrapper; isolation `none` for the test only),
-  `~/bin/test-cpu-lane-api.py`, `~/bin/test-cpu-lane-queue.py` (canary seams `cpuapi`, `cpulane`).
-
 ## Queue API contract (reference: `reference/queue_server.py`)
-All under `/api/cpu/`, header `Authorization: Bearer <token>` (token from file; compare constant-time;
-`GET health` is unauthenticated). Add a CORS-less, Access-bypassed LAN path: ollama-queue-api.py currently
-trusts every request because Cloudflare Access fronts it; these routes must check the token themselves.
+All under `/api/cpu/`, header `Authorization: Bearer <token>` (compare constant-time; `GET health` and `POST enroll` are
+unauthenticated). These routes must be LAN-only and check the token themselves (refuse proxied/CDN-fronted requests).
 
 Producer (client):
 - `POST jobs` `{spec,label,stage,bundle_id}` -> 201 `{id}`; status `uploading`.
@@ -143,6 +142,10 @@ Producer (client):
 - `POST jobs/<id>/ready` -> status `pending` (400 if no payload)
 - `GET jobs/<id>` -> `{status: uploading|pending|running|done|failed_infra|cancelled, attempt, result}`
 - `DELETE jobs/<id>` -> cancel (pending -> cancelled; running -> heartbeat returns `cancel:true`)
+
+Enrollment and config (agent, see "Enrollment"):
+- `POST enroll` `{code, runner_id}` -> 200 `{token, runner_id, config}`; 403 for an unknown/expired/used code; 429 after repeated failures. Codes are single use.
+- `GET config` -> `{config: {concurrency, lease_s, max_job_timeout_s, cache_max_entries, node_options}}`; explicit env vars on the runner win; `isolation` is never remote.
 
 Runner (agent):
 - `POST claim` `{runner_id, lease_s}` -> 200 `{job:{id, spec(+has_patch,has_tools), attempt, lease_token}}` or 204.
@@ -153,9 +156,6 @@ Runner (agent):
 - `POST jobs/<id>/release` `{runner_id, lease_token}` -> job back to `pending`
 - Server-side reaper (on every request or timer): `running` with lease_expires < now -> `pending` (attempt kept; at 3 -> `failed_infra`).
 
-Queue integration (done): CPU jobs are not queue rows at all, so they never occupy a lane; what used to hold the
-GPU was the bundle commitment, which now yields to a bundle that only waits on a CPU stage (see "Queue side").
-
 ## Client / integration points
     from cpu_job import submit_cpu_job
     r = submit_cpu_job(worktree, "bash verify.sh", timeout_s=300, stage="final-verify",
@@ -164,17 +164,21 @@ GPU was the bundle commitment, which now yields to a bundle that only waits on a
 Falls back to a local subprocess (same timeout/process-group semantics) if `CPU_RUNNER_API` is unset, the API is
 unreachable/unauthorised, no runner claims within `claim_timeout_s` (180), the job exceeds `max_wait_s`, or the
 runner reports `infra_error`. `fallback=False` raises instead. Config: `CPU_RUNNER_API`, `CPU_RUNNER_TOKEN_FILE`
-(default `~/.config/dispatch-cpu-runner/token`).
-Stages to move: baseline verify, final verify, preflight both-ways verify, relevance mutation
-(`verify-relevance.py`, ship via `tools`), harness-check (`auto-harness-check.py`), slicer scaffolding
-(npm ci / prisma generate are covered by the dep cache). **Not** in-job `run_bash` (latency; stays local).
-Caveats: the verify command must be self-contained inside the checkout (+ `$JOB_TOOLS`); it cannot reach
-`~/.ollama-dispatch/node_modules-cache` or Mac paths; the runner has no network for the command itself.
+(default `~/.config/dispatch-cpu-runner/token`, a file you create).
+(ship helper scripts via `tools`). Caveat: the command must be self-contained inside the checkout (+ `$JOB_TOOLS`); the runner has no network for the command itself.
 
 ## Tests
 `python3 -W ignore -m unittest discover -s tests -v` (needs git, python3; no Docker). Covers: bundle + dirty +
 untracked + ignored-excluded shipping and unchanged real index, archive mode/cwd, env allowlist and token
 non-leak, dep cache miss/hit/lockfile change, timeout kills process group, exit codes/tails, lease expiry
 requeue after hard runner kill (attempt 2), lease-lost kills job without posting, local fallback (unreachable,
-unconfigured, unclaimed -> cancel, bad token), isolation fail-closed. `scripts/sandbox-e2e.sh` runs them on
-claude-sandbox over SSH (no node there: tests use a fake `npm`) and deletes everything afterwards.
+unconfigured, unclaimed -> cancel, bad token), isolation fail-closed.
+
+## Tests
+`python3 -W ignore -m unittest discover -s tests -v` (needs git and python3; no Docker). Covers bundle, dirty and untracked
+file shipping, env allowlist and token non-leak, dep cache miss/hit, timeouts, lease expiry requeue, lease-lost handling,
+local fallback, isolation fail-closed, enrollment (single use, 0600 storage, rotation, remote config) and self-reload.
+CI runs these and publishes the image on every push to `main` and on `v*` tags.
+
+## License
+MIT, see `LICENSE`.

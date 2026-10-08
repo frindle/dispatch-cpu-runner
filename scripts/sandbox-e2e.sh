@@ -1,8 +1,9 @@
 #!/bin/bash
-# Run the full test suite on claude-sandbox over SSH, then remove everything it created.
+# Run the full test suite on a disposable remote Linux box over SSH (SANDBOX_SSH='ssh -i KEY user@host'), then remove everything it created.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-SSH=(ssh -i "$HOME/.ssh/id_ed25519_sandbox" -o BatchMode=yes claude@claude-sandbox)
+[ -n "${SANDBOX_SSH:-}" ] || { echo "set SANDBOX_SSH, e.g. 'ssh -i ~/.ssh/key user@host'" >&2; exit 2; }
+read -r -a SSH <<< "$SANDBOX_SSH -o BatchMode=yes"
 REMOTE=/tmp/dispatch-cpu-runner-e2e
 trap '"${SSH[@]}" "rm -rf $REMOTE /tmp/cpurunner-test-*" || true' EXIT
 "${SSH[@]}" "rm -rf $REMOTE && mkdir -p $REMOTE"

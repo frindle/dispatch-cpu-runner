@@ -18,6 +18,9 @@ class Store:
         self.jobs, self.order = {}, []
         self.lock = threading.Lock()
         self.runner_seen = {}
+        self.codes = set()          # live single-use enrollment codes
+        self.config = {"concurrency": 2, "lease_s": 60}
+        self.enrolled = []
 
     def reap(self):
         """Lease expiry: running jobs whose lease lapsed go back to pending (or failed_infra)."""
@@ -61,6 +64,16 @@ class H(BaseHTTPRequestHandler):
         path = self.path.split("?")[0]
         if path == "/api/cpu/health":
             return self._send(200, {"ok": True})
+        if method == "POST" and path == "/api/cpu/enroll":
+            b = self._json()
+            with S.lock:
+                ok = b.get("code") in S.codes
+                S.codes.discard(b.get("code"))
+                if ok:
+                    S.enrolled.append(b.get("runner_id"))
+            if not ok:
+                return self._send(403, {"error": "invalid, expired or already used enrollment code"})
+            return self._send(200, {"token": S.token, "runner_id": b.get("runner_id"), "config": S.config})
         if self.headers.get("Authorization") != "Bearer " + S.token:
             return self._send(401, {"error": "unauthorized"})
         with S.lock:
@@ -90,6 +103,8 @@ class H(BaseHTTPRequestHandler):
                         return self._send(200, {"job": {"id": jid, "spec": spec, "attempt": j["attempt"],
                                                         "lease_token": j["lease_token"]}})
                 return self._send(204)
+            if method == "GET" and path == "/api/cpu/config":
+                return self._send(200, {"config": S.config})
             if method == "GET" and path == "/api/cpu/runners":
                 return self._send(200, {"runners": S.runner_seen})
             m = re.match(r"^/api/cpu/jobs/([0-9a-f]+)(?:/(\w+))?$", path)

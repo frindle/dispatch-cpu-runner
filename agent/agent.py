@@ -8,13 +8,15 @@ result. A heartbeat thread keeps the lease alive; if the lease is lost (409) or
 the producer cancels, the job's process group is killed and no result is posted.
 
 Subcommands: run (default) | selftest | healthcheck
-Config is all env (see README / env.example). Secrets are read from a file.
+Config is env (see README / env.example); a few tunables can also be pulled from the queue API (env wins).
+The shared token comes from CPU_RUNNER_TOKEN_FILE / CPU_RUNNER_TOKEN, else from the state dir (CPU_RUNNER_STATE_DIR/token),
+which the agent fills itself by enrolling once with CPU_RUNNER_ENROLL_CODE (single-use code minted on the queue host).
 """
-import base64, fnmatch, hashlib, io, json, os, pwd, shlex, shutil, signal, socket
+import base64, fnmatch, re, hashlib, io, json, os, pwd, shlex, shutil, signal, socket
 import subprocess, sys, tarfile, tempfile, threading, time, urllib.error, urllib.request
 import fcntl
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 
 def env(name, default=None, cast=str):
@@ -27,6 +29,8 @@ def env(name, default=None, cast=str):
 class Config:
     def __init__(self):
         self.api = (env("CPU_RUNNER_API", "http://127.0.0.1:7684")).rstrip("/")
+        self.state_dir = env("CPU_RUNNER_STATE_DIR", "/state")
+        self.enroll_code = (env("CPU_RUNNER_ENROLL_CODE", "") or "").strip()
         self.token = self._token()
         self.runner_id = env("CPU_RUNNER_ID", socket.gethostname())
         self.concurrency = env("CPU_RUNNER_CONCURRENCY", 2, int)
@@ -59,12 +63,44 @@ class Config:
         self.reload_check_s = env("CPU_RUNNER_RELOAD_CHECK_S", 5.0, float)
         self.reload_grace_s = env("CPU_RUNNER_RELOAD_GRACE_S", 1800, int)
 
+    # remote-tunable settings: API key -> (attr, env var that overrides it, cast, lo, hi)
+    REMOTE = {"concurrency": ("concurrency", "CPU_RUNNER_CONCURRENCY", int, 1, 16),
+              "lease_s": ("lease_s", "CPU_RUNNER_LEASE_S", int, 15, 600),
+              "max_job_timeout_s": ("max_job_timeout_s", "CPU_RUNNER_MAX_TIMEOUT_S", int, 30, 21600),
+              "cache_max_entries": ("cache_max_entries", "CPU_RUNNER_CACHE_MAX", int, 1, 64),
+              "poll_s": ("poll_s", "CPU_RUNNER_POLL_S", float, 0.5, 60)}
+
+    def apply_remote(self, conf):
+        """Apply API-provided settings. Explicit env vars always win; values are clamped; isolation is never remote."""
+        applied = {}
+        if not isinstance(conf, dict):
+            return applied
+        for key, (attr, envname, cast, lo, hi) in self.REMOTE.items():
+            if key not in conf or env(envname) is not None:
+                continue
+            try:
+                v = min(hi, max(lo, cast(conf[key])))
+            except (TypeError, ValueError):
+                continue
+            setattr(self, attr, v)
+            applied[key] = v
+        no = conf.get("node_options")
+        if env("CPU_RUNNER_NODE_OPTIONS") is None and isinstance(no, str) and re.fullmatch(r"(--[a-z-]+=[\w.]+ ?)+", no.strip()):
+            self.node_options = no.strip()
+            applied["node_options"] = self.node_options
+        return applied
+
+    @property
+    def stored_token_path(self):
+        return os.path.join(self.state_dir, "token")
+
     def _token(self):
-        """Token from CPU_RUNNER_TOKEN_FILE (or CPU_RUNNER_TOKEN). Never invented: the Mac
-        shares it. A missing/empty source leaves token "" and sets token_error."""
+        """Token from CPU_RUNNER_TOKEN_FILE, CPU_RUNNER_TOKEN, or the stored enrolled token (state dir).
+        Never invented here. A missing source leaves token "" and sets token_error (-> enroll or exit)."""
         self.token_error = None
+        self.token_source = None
         f = env("CPU_RUNNER_TOKEN_FILE")
-        if f:
+        if f and os.path.exists(f):
             try:
                 with open(f) as fh:
                     tok = fh.read().strip()
@@ -73,11 +109,23 @@ class Config:
                 return ""
             if not tok:
                 self.token_error = "token file %s is empty" % f
+            self.token_source = "file"
             return tok
         tok = env("CPU_RUNNER_TOKEN", "")
-        if not tok:
-            self.token_error = "no CPU_RUNNER_TOKEN_FILE or CPU_RUNNER_TOKEN configured"
-        return tok
+        if tok:
+            self.token_source = "env"
+            return tok
+        try:
+            with open(self.stored_token_path) as fh:
+                tok = fh.read().strip()
+            if tok:
+                self.token_source = "stored"
+                return tok
+        except OSError:
+            pass
+        self.token_error = ("no token: CPU_RUNNER_TOKEN_FILE %s not found, CPU_RUNNER_TOKEN unset, nothing stored in %s"
+                            % (f, self.state_dir)) if f else ("no token: CPU_RUNNER_TOKEN unset, nothing stored in %s" % self.state_dir)
+        return ""
 
 
 def log(event, **kw):
@@ -91,11 +139,74 @@ class LeaseLost(Exception):
     pass
 
 
+def enroll(cfg, timeout=15):
+    """Exchange the single-use enrollment code for the long-lived token (over the LAN), store it 0600 in the
+    state dir. Returns (ok, message, remote_config). The token and the code are never logged."""
+    if not cfg.enroll_code:
+        return False, "no CPU_RUNNER_ENROLL_CODE configured", None
+    req = urllib.request.Request(cfg.api + "/api/cpu/enroll", method="POST",
+                                 data=json.dumps({"code": cfg.enroll_code, "runner_id": cfg.runner_id}).encode(),
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            body = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        try:
+            msg = json.loads(e.read()).get("error", "")
+        except Exception:
+            msg = ""
+        return False, "enrollment refused (HTTP %d %s)" % (e.code, msg), None
+    except Exception as e:
+        return False, "queue API unreachable at %s (%s)" % (cfg.api, e), None
+    tok = (body.get("token") or "").strip()
+    if not tok:
+        return False, "enrollment response had no token", None
+    try:
+        os.makedirs(cfg.state_dir, exist_ok=True)
+        tmp = cfg.stored_token_path + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(tok + "\n")
+        os.replace(tmp, cfg.stored_token_path)
+        os.chmod(cfg.stored_token_path, 0o600)
+    except OSError as e:
+        return False, "cannot store token in %s (%s): is the state volume mounted writable?" % (cfg.state_dir, e.strerror or e), None
+    cfg.token, cfg.token_source, cfg.token_error = tok, "stored", None
+    return True, "enrolled", body.get("config")
+
+
 class Api:
     def __init__(self, cfg):
         self.cfg = cfg
+        self._re_lock = threading.Lock()
+        self._re_last = 0.0
+
+    def _reenroll(self, old_token):
+        """After a 401: if a fresh code is configured, enroll again (rate-limited); True when the token changed."""
+        with self._re_lock:
+            if self.cfg.token != old_token:
+                return True               # another thread already refreshed it
+            if self.cfg.token_source in ("file", "env") or not self.cfg.enroll_code:
+                return False
+            if time.time() - self._re_last < 60:
+                return False
+            self._re_last = time.time()
+            ok, msg, conf = enroll(self.cfg)
+            if ok:
+                log("reenrolled", applied=self.cfg.apply_remote(conf or {}))
+            else:
+                log("reenroll_failed", error=msg,
+                    hint="token rejected. On the queue host run 'cpu_lane.py enroll-code' and put the new code in the container's CPU_RUNNER_ENROLL_CODE")
+            return ok
 
     def call(self, method, path, body=None, raw=None, timeout=30, want_bytes=False):
+        tok = self.cfg.token
+        code, out = self._call(method, path, body, raw, timeout, want_bytes)
+        if code in (401, 403) and raw is None and self._reenroll(tok):
+            return self._call(method, path, body, raw, timeout, want_bytes)
+        return code, out
+
+    def _call(self, method, path, body=None, raw=None, timeout=30, want_bytes=False):
         data = raw if raw is not None else (json.dumps(body).encode() if body is not None else None)
         req = urllib.request.Request(self.cfg.api + path, data=data, method=method)
         req.add_header("Authorization", "Bearer " + self.cfg.token)
@@ -570,7 +681,7 @@ class Agent:
         except Exception as e:
             self.set_status(api="unreachable")
             log("api_unreachable", api=cfg.api, error=str(e),
-                hint="check CPU_RUNNER_API in .env (re-run scripts/provision.sh on the Mac) and that the queue API is up")
+                hint="check CPU_RUNNER_API (the queue host's LAN URL) and that the queue API is running")
             return
         if code != 200:
             self.set_status(api="unhealthy")
@@ -585,7 +696,7 @@ class Agent:
         if code in (401, 403):
             self.set_status(api="token_rejected")
             log("token_rejected", api=cfg.api, http=code,
-                hint="the token in secrets/token does not match the Mac; re-run scripts/provision.sh on the Mac, then ./deploy.sh")
+                hint="token rejected (rotated?). Mint a new code on the queue host (cpu_lane.py enroll-code), set CPU_RUNNER_ENROLL_CODE, restart")
         elif code == 200:
             self.set_status(api="ok")
             log("api_ok", api=cfg.api, token="accepted")
@@ -625,7 +736,7 @@ class Agent:
             log("selftest", result="PASS" if ok else "FAIL", detail=text)
             if not ok and self.cfg.isolation == "required":
                 log("fatal", error="startup selftest FAILED; refusing to run jobs (fail closed). "
-                                   "If it cannot create a network namespace, run ./deploy.sh --relax-seccomp")
+                                   "If it cannot create a network namespace, add --security-opt seccomp=unconfined (see README)")
                 return False
         else:
             self.set_status(selftest="skipped")
@@ -646,7 +757,7 @@ class Agent:
             if code in (401, 403):
                 if self.status.get("api") != "token_rejected":
                     self.set_status(api="token_rejected")
-                    log("token_rejected", http=code, hint="re-run scripts/provision.sh on the Mac, then ./deploy.sh")
+                    log("token_rejected", http=code, hint="token rejected (rotated?). Mint a new code on the queue host (cpu_lane.py enroll-code), set CPU_RUNNER_ENROLL_CODE, restart")
                 self.stop.wait(min(30, cfg.poll_s * 5))
                 continue
             if self.status.get("api") != "ok" and code in (200, 204):
@@ -770,10 +881,24 @@ def main(argv):
     cmd = argv[1] if len(argv) > 1 else "run"
     if cmd == "run":
         if not cfg.token:
-            sys.stderr.write("cpu-runner: no shared token (%s). Run scripts/provision.sh on the Mac, then ./deploy.sh here. "
-                             "The token is never generated on this side.\n" % cfg.token_error)
-            log("fatal", error="missing token: " + str(cfg.token_error), fix="run scripts/provision.sh on the Mac")
-            return 4
+            if cfg.enroll_code:
+                ok, msg, conf = enroll(cfg)
+                log("enrolled" if ok else "enroll_failed", ok=ok, message=msg, api=cfg.api)
+                if not ok:
+                    sys.stderr.write("cpu-runner: %s. Mint a fresh code on the queue host (cpu_lane.py enroll-code) and set CPU_RUNNER_ENROLL_CODE.\n" % msg)
+                    time.sleep(30)          # slow the restart loop
+                    return 4
+            else:
+                sys.stderr.write("cpu-runner: %s. Set CPU_RUNNER_ENROLL_CODE (cpu_lane.py enroll-code on the queue host) "
+                                 "or CPU_RUNNER_TOKEN. The token is never generated on this side.\n" % cfg.token_error)
+                log("fatal", error=str(cfg.token_error), fix="set CPU_RUNNER_ENROLL_CODE (run 'cpu_lane.py enroll-code' on the queue host)")
+                return 4
+        try:
+            code, body = Api(cfg).call("GET", "/api/cpu/config", timeout=10)
+            if code == 200 and isinstance(body, dict):
+                log("config_pulled", applied=cfg.apply_remote(body.get("config")))
+        except Exception as e:
+            log("config_pull_failed", error=str(e))
         return Agent(cfg).run()
     if cmd == "selftest":
         return selftest(cfg)
