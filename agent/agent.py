@@ -1,0 +1,634 @@
+#!/usr/bin/env python3
+"""dispatch-cpu-runner agent: pull-based CPU job runner (stdlib only).
+
+Loop (x CONCURRENCY threads): claim -> download payload -> materialize a fresh
+checkout -> restore/populate the node_modules cache (keyed by lockfile hash) ->
+run the command with a timeout inside an empty network namespace -> post the
+result. A heartbeat thread keeps the lease alive; if the lease is lost (409) or
+the producer cancels, the job's process group is killed and no result is posted.
+
+Subcommands: run (default) | selftest | healthcheck
+Config is all env (see README / env.example). Secrets are read from a file.
+"""
+import base64, fnmatch, hashlib, io, json, os, pwd, shlex, shutil, signal, socket
+import subprocess, sys, tarfile, tempfile, threading, time, urllib.error, urllib.request
+import fcntl
+
+VERSION = "1.0.0"
+
+
+def env(name, default=None, cast=str):
+    v = os.environ.get(name)
+    if v is None or v == "":
+        return default
+    return cast(v)
+
+
+class Config:
+    def __init__(self):
+        self.api = (env("CPU_RUNNER_API", "http://127.0.0.1:7684")).rstrip("/")
+        self.token = self._token()
+        self.runner_id = env("CPU_RUNNER_ID", socket.gethostname())
+        self.concurrency = env("CPU_RUNNER_CONCURRENCY", 2, int)
+        self.cache_dir = env("CPU_RUNNER_CACHE", "/cache")
+        self.work_dir = env("CPU_RUNNER_WORK", "/work")
+        self.poll_s = env("CPU_RUNNER_POLL_S", 3.0, float)
+        self.lease_s = env("CPU_RUNNER_LEASE_S", 60, int)
+        self.heartbeat_s = env("CPU_RUNNER_HEARTBEAT_S", 15.0, float)
+        self.install_timeout_s = env("CPU_RUNNER_INSTALL_TIMEOUT_S", 900, int)
+        self.max_job_timeout_s = env("CPU_RUNNER_MAX_TIMEOUT_S", 3600, int)
+        self.tail_bytes = env("CPU_RUNNER_TAIL_BYTES", 65536, int)
+        self.cache_max_entries = env("CPU_RUNNER_CACHE_MAX", 8, int)
+        self.shutdown_grace_s = env("CPU_RUNNER_SHUTDOWN_GRACE_S", 30, int)
+        # required: refuse to run unless the empty-netns wrapper works (default)
+        # auto: use it when available, else run unisolated (logged loudly)
+        # none: never isolate (tests / sandbox only)
+        self.isolation = env("CPU_RUNNER_ISOLATION", "required")
+        self.install_cmd = env("CPU_RUNNER_INSTALL_CMD", "npm ci --prefer-offline --no-audit --no-fund")
+        self.prisma_cmd = env("CPU_RUNNER_PRISMA_CMD", "npx --no-install prisma generate")
+        self.env_allow = [p.strip() for p in env(
+            "CPU_RUNNER_ENV_ALLOW",
+            "VERIFY_*,DISPATCH_*,TEST_*,NODE_ENV,CI,TZ,LANG,LC_*,PRISMA_*,DATABASE_URL").split(",") if p.strip()]
+        self.node_options = env("CPU_RUNNER_NODE_OPTIONS", "--max-old-space-size=3072")
+        self.nice = env("CPU_RUNNER_NICE", 5, int)
+        self.job_user = env("CPU_RUNNER_JOB_USER", "runner")
+        self.health_file = env("CPU_RUNNER_HEALTH_FILE", "/tmp/cpu-runner.health")
+
+    @staticmethod
+    def _token():
+        f = env("CPU_RUNNER_TOKEN_FILE")
+        if f:
+            with open(f) as fh:
+                return fh.read().strip()
+        return env("CPU_RUNNER_TOKEN", "")
+
+
+def log(event, **kw):
+    kw.update(ts=round(time.time(), 3), event=event)
+    sys.stdout.write(json.dumps(kw, default=str) + "\n")
+    sys.stdout.flush()
+
+
+# ----------------------------------------------------------------- API client
+class LeaseLost(Exception):
+    pass
+
+
+class Api:
+    def __init__(self, cfg):
+        self.cfg = cfg
+
+    def call(self, method, path, body=None, raw=None, timeout=30, want_bytes=False):
+        data = raw if raw is not None else (json.dumps(body).encode() if body is not None else None)
+        req = urllib.request.Request(self.cfg.api + path, data=data, method=method)
+        req.add_header("Authorization", "Bearer " + self.cfg.token)
+        req.add_header("Content-Type", "application/octet-stream" if raw is not None else "application/json")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                payload = r.read()
+                if r.status == 204 or not payload:
+                    return r.status, None
+                return r.status, payload if want_bytes else json.loads(payload)
+        except urllib.error.HTTPError as e:
+            txt = e.read()
+            try:
+                return e.code, json.loads(txt)
+            except Exception:
+                return e.code, {"error": txt[:200].decode("utf-8", "replace")}
+
+    def download(self, path, dest):
+        req = urllib.request.Request(self.cfg.api + path)
+        req.add_header("Authorization", "Bearer " + self.cfg.token)
+        with urllib.request.urlopen(req, timeout=300) as r, open(dest, "wb") as out:
+            shutil.copyfileobj(r, out, 1 << 20)
+
+
+# ------------------------------------------------------------------ isolation
+def am_root():
+    return os.geteuid() == 0
+
+
+def job_ids(cfg):
+    try:
+        pw = pwd.getpwnam(cfg.job_user)
+        return pw.pw_uid, pw.pw_gid
+    except KeyError:
+        return None, None
+
+
+def priv_drop_prefix(cfg):
+    """setpriv prefix that drops root to the job user with no capabilities."""
+    if not am_root():
+        return []
+    uid, gid = job_ids(cfg)
+    if uid is None:
+        raise RuntimeError("job user %r missing" % cfg.job_user)
+    return ["setpriv", "--reuid=%d" % uid, "--regid=%d" % gid, "--clear-groups",
+            "--bounding-set=-all", "--inh-caps=-all", "--no-new-privs"]
+
+
+NET_FLAGS_FULL = ["unshare", "--net", "--pid", "--fork", "--kill-child"]
+NET_FLAGS_MIN = ["unshare", "--net"]
+LO_UP = 'ip link set lo up 2>/dev/null; exec "$@"'
+
+
+def isolation_prefix(cfg, flags):
+    """Command prefix: empty netns (only loopback, brought up) then drop privileges."""
+    return flags + ["--", "sh", "-c", LO_UP, "sh"] + priv_drop_prefix(cfg)
+
+
+def probe_isolation(cfg):
+    """Return the working unshare flag list, or None. Proves netns works by running
+    a command inside it that must see only 'lo'."""
+    if cfg.isolation == "none":
+        return None
+    check = ["sh", "-c", "ls /sys/class/net | tr '\\n' ' '"]
+    for flags in (NET_FLAGS_FULL, NET_FLAGS_MIN):
+        try:
+            r = subprocess.run(isolation_prefix(cfg, flags) + check, capture_output=True,
+                               text=True, timeout=20)
+        except Exception as e:  # missing binary
+            log("isolation_probe_error", flags=flags, error=str(e))
+            continue
+        ifs = r.stdout.split()
+        if r.returncode == 0 and ifs == ["lo"]:
+            return flags
+        log("isolation_probe_failed", flags=flags, rc=r.returncode, ifaces=ifs, err=r.stderr[-200:])
+    return None
+
+
+# ----------------------------------------------------------------- job runner
+class Job:
+    def __init__(self, cfg, api, claim, iso_flags):
+        self.cfg, self.api, self.iso_flags = cfg, api, iso_flags
+        self.id = claim["id"]
+        self.spec = claim["spec"]
+        self.lease_token = claim["lease_token"]
+        self.attempt = claim.get("attempt", 1)
+        self.dir = tempfile.mkdtemp(prefix="job-%s-" % self.id[:12], dir=cfg.work_dir)
+        self.proc = None
+        self.abort = None  # "lease_lost" | "cancelled" | "shutdown"
+        self.timings = {}
+        self._hb_stop = threading.Event()
+
+    # ---- helpers
+    def _t(self, name, t0):
+        self.timings[name] = round(time.time() - t0, 2)
+
+    def run_user(self, argv, cwd, env_, timeout, out_path=None):
+        """Run argv as the job user (privilege dropped), WITH network (install phase)."""
+        argv = priv_drop_prefix(self.cfg) + argv
+        out = open(out_path, "ab") if out_path else subprocess.DEVNULL
+        try:
+            return subprocess.run(argv, cwd=cwd, env=env_, stdout=out, stderr=subprocess.STDOUT,
+                                  timeout=timeout)
+        finally:
+            if out_path:
+                out.close()
+
+    def base_env(self):
+        e = {"PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+             "HOME": os.path.join(self.dir, "home"), "TMPDIR": os.path.join(self.dir, "tmp"),
+             "CI": "1", "LANG": "C.UTF-8", "JOB_TOOLS": os.path.join(self.dir, "tools"),
+             "NPM_CONFIG_CACHE": os.path.join(self.cfg.cache_dir, "npm"),
+             "NODE_OPTIONS": self.cfg.node_options, "CPU_RUNNER_JOB_ID": self.id}
+        return e
+
+    def job_env(self):
+        e = self.base_env()
+        for k, v in (self.spec.get("env") or {}).items():
+            if any(fnmatch.fnmatchcase(k, p) for p in self.cfg.env_allow):
+                e[k] = str(v)
+            else:
+                log("env_dropped", job=self.id, key=k)
+        return e
+
+    # ---- phases
+    def materialize(self):
+        t0 = time.time()
+        d = self.dir
+        for sub in ("home", "tmp", "out", "tools", "dl"):
+            os.makedirs(os.path.join(d, sub))
+        self.root = os.path.join(d, "checkout")
+        kind = self.spec.get("payload_kind", "bundle")
+        pay = os.path.join(d, "dl", "payload")
+        self.api.download("/api/cpu/jobs/%s/payload" % self.id, pay)
+        if kind == "bundle":
+            self.git("clone", "-q", pay, self.root, cwd=d)
+        elif kind == "archive":
+            os.makedirs(self.root)
+            with tarfile.open(pay) as tf:
+                _safe_extract(tf, self.root)
+            self.git("init", "-q", cwd=self.root)
+            self.git("add", "-A", cwd=self.root)
+            self.git("-c", "user.name=runner", "-c", "user.email=runner@localhost",
+                     "commit", "-q", "-m", "snapshot", "--allow-empty", cwd=self.root)
+        else:
+            raise RuntimeError("unknown payload_kind %r" % kind)
+        if self.spec.get("has_patch"):
+            patch = os.path.join(d, "dl", "patch")
+            self.api.download("/api/cpu/jobs/%s/patch" % self.id, patch)
+            if os.path.getsize(patch):
+                self.git("apply", "--binary", "--whitespace=nowarn", patch, cwd=self.root)
+        if self.spec.get("has_tools"):
+            tools = os.path.join(d, "dl", "tools.tgz")
+            self.api.download("/api/cpu/jobs/%s/tools" % self.id, tools)
+            with tarfile.open(tools) as tf:
+                _safe_extract(tf, os.path.join(d, "tools"))
+        if am_root():
+            uid, gid = job_ids(self.cfg)
+            for dp, dns, fns in os.walk(d):
+                os.chown(dp, uid, gid)
+                for n in dns + fns:
+                    try:
+                        os.lchown(os.path.join(dp, n), uid, gid)
+                    except OSError:
+                        pass
+        self._t("materialize_s", t0)
+
+    def git(self, *args, cwd):
+        r = subprocess.run(["git", "-c", "safe.directory=*"] + list(args), cwd=cwd, capture_output=True,
+                           text=True, timeout=300)
+        if r.returncode:
+            raise RuntimeError("git %s failed: %s" % (args[0], (r.stderr or r.stdout)[-400:]))
+
+    def find_pkg_root(self):
+        cwd = os.path.normpath(os.path.join(self.root, self.spec.get("cwd") or "."))
+        if not (cwd == self.root or cwd.startswith(self.root + os.sep)):
+            raise RuntimeError("cwd escapes checkout")
+        p = cwd
+        while True:
+            if os.path.exists(os.path.join(p, "package-lock.json")):
+                return p
+            if p == self.root:
+                return None
+            p = os.path.dirname(p)
+
+    def deps(self):
+        t0 = time.time()
+        pkg = self.find_pkg_root()
+        info = {"cache": "none"}
+        if pkg is None:
+            self.timings["deps"] = info
+            return
+        h = hashlib.sha256()
+        h.update(open(os.path.join(pkg, "package-lock.json"), "rb").read())
+        for extra in ("prisma/schema.prisma", "package.json"):
+            fp = os.path.join(pkg, extra)
+            if extra == "package.json" or os.path.exists(fp):
+                # package.json: only deps matter for install, but scripts/postinstall can too
+                h.update(extra.encode())
+                try:
+                    h.update(open(fp, "rb").read())
+                except OSError:
+                    pass
+        h.update(("node:" + _node_major() + ":" + os.uname().machine).encode())
+        key = h.hexdigest()[:24]
+        hint = self.spec.get("lockfile_hash")
+        info["key"] = key
+        nm_cache = os.path.join(self.cfg.cache_dir, "nm")
+        entry = os.path.join(nm_cache, key)
+        os.makedirs(os.path.join(self.cfg.cache_dir, "locks"), exist_ok=True)
+        lockf = open(os.path.join(self.cfg.cache_dir, "locks", key + ".lock"), "w")
+        fcntl.flock(lockf, fcntl.LOCK_EX)
+        try:
+            dest = os.path.join(pkg, "node_modules")
+            env_ = self.base_env()
+            if os.path.isdir(entry):
+                info["cache"] = "hit"
+                os.utime(entry, None)
+                self.run_user(["cp", "-a", entry, dest], pkg, env_, 600)
+            else:
+                info["cache"] = "miss"
+                out = os.path.join(self.dir, "out", "install.log")
+                r = self.run_user(["bash", "-c", self.cfg.install_cmd], pkg, env_, self.cfg.install_timeout_s, out)
+                if r.returncode:
+                    raise RuntimeError("dependency install failed rc=%d: %s" % (r.returncode, _tail(out, 2000)))
+                has_prisma = os.path.exists(os.path.join(pkg, "prisma", "schema.prisma")) and \
+                    os.path.isdir(os.path.join(dest, "prisma"))
+                if has_prisma:
+                    r = self.run_user(["bash", "-c", self.cfg.prisma_cmd], pkg, env_, 600, out)
+                    if r.returncode:
+                        raise RuntimeError("prisma generate failed rc=%d: %s" % (r.returncode, _tail(out, 2000)))
+                    info["prisma"] = True
+                os.makedirs(nm_cache, exist_ok=True)
+                tmp = entry + ".tmp-%d-%s" % (os.getpid(), self.id[:8])
+                self.run_user(["cp", "-a", dest, tmp], pkg, env_, 600)
+                os.rename(tmp, entry)
+                self._prune(nm_cache)
+        finally:
+            fcntl.flock(lockf, fcntl.LOCK_UN)
+            lockf.close()
+        info["seconds"] = round(time.time() - t0, 2)
+        self.timings["deps"] = info
+        log("deps", job=self.id, **info)
+
+    def _prune(self, nm_cache):
+        try:
+            ents = [os.path.join(nm_cache, n) for n in os.listdir(nm_cache) if ".tmp-" not in n]
+            ents.sort(key=lambda p: os.stat(p).st_mtime)
+            for p in ents[:max(0, len(ents) - self.cfg.cache_max_entries)]:
+                shutil.rmtree(p, ignore_errors=True)
+                log("cache_evict", path=p)
+        except OSError:
+            pass
+
+    def execute(self):
+        spec = self.spec
+        cmd = spec["cmd"]
+        argv = ["bash", "-c", cmd] if isinstance(cmd, str) else list(cmd)
+        timeout = min(int(spec.get("timeout_s") or 600), self.cfg.max_job_timeout_s)
+        cwd = os.path.normpath(os.path.join(self.root, spec.get("cwd") or "."))
+        if not (cwd == self.root or cwd.startswith(self.root + os.sep)):
+            raise RuntimeError("cwd escapes checkout")
+        net = spec.get("network", "none")
+        if net == "none" and self.iso_flags:
+            full = isolation_prefix(self.cfg, self.iso_flags) + argv
+        elif net == "none" and self.cfg.isolation == "required":
+            raise RuntimeError("isolation_unavailable")
+        else:
+            full = priv_drop_prefix(self.cfg) + argv
+        if self.cfg.nice:
+            full = ["nice", "-n", str(self.cfg.nice)] + full
+        so, se = (os.path.join(self.dir, "out", n) for n in ("stdout", "stderr"))
+        t0 = time.time()
+        timed_out = False
+        with open(so, "wb") as fo, open(se, "wb") as fe:
+            self.proc = subprocess.Popen(full, cwd=cwd, env=self.job_env(), stdout=fo, stderr=fe,
+                                         stdin=subprocess.DEVNULL, start_new_session=True)
+            while True:
+                try:
+                    self.proc.wait(timeout=0.5)
+                    break
+                except subprocess.TimeoutExpired:
+                    pass
+                if self.abort:
+                    self.kill()
+                    break
+                if time.time() - t0 > timeout:
+                    timed_out = True
+                    self.kill()
+                    break
+        self._t("run_s", t0)
+        rc = self.proc.returncode
+        return {"exit_code": rc if rc is not None else -1, "timed_out": timed_out,
+                "stdout_tail": _tail(so, self.cfg.tail_bytes), "stderr_tail": _tail(se, self.cfg.tail_bytes)}
+
+    def kill(self):
+        p = self.proc
+        if not p or p.poll() is not None:
+            return
+        for sig, wait in ((signal.SIGTERM, 5), (signal.SIGKILL, 10)):
+            try:
+                os.killpg(p.pid, sig)
+            except ProcessLookupError:
+                break
+            try:
+                p.wait(timeout=wait)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+        # sweep stragglers in the group (children that ignored TERM)
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    # ---- heartbeat
+    def _heartbeat(self):
+        misses = 0
+        while not self._hb_stop.wait(self.cfg.heartbeat_s):
+            try:
+                code, body = self.api.call("POST", "/api/cpu/jobs/%s/heartbeat" % self.id,
+                                           {"runner_id": self.cfg.runner_id, "lease_token": self.lease_token,
+                                            "lease_s": self.cfg.lease_s}, timeout=10)
+            except Exception as e:
+                misses += 1
+                log("heartbeat_error", job=self.id, error=str(e), misses=misses)
+                continue
+            misses = 0
+            if code == 409:
+                self.abort = "lease_lost"
+                log("lease_lost", job=self.id)
+                self.kill()
+                return
+            if code == 200 and body and body.get("cancel"):
+                self.abort = "cancelled"
+                log("job_cancelled", job=self.id)
+                self.kill()
+                return
+
+    def run(self):
+        t_all = time.time()
+        hb = threading.Thread(target=self._heartbeat, daemon=True)
+        hb.start()
+        result = None
+        try:
+            self.materialize()
+            if self.abort:
+                raise LeaseLost()
+            self.deps()
+            if self.abort:
+                raise LeaseLost()
+            result = self.execute()
+        except LeaseLost:
+            pass
+        except Exception as e:
+            log("job_infra_error", job=self.id, error=str(e))
+            result = {"exit_code": None, "timed_out": False, "infra_error": str(e)[:1000],
+                      "stdout_tail": "", "stderr_tail": ""}
+        finally:
+            self._hb_stop.set()
+            self._t("total_s", t_all)
+        if self.abort in ("lease_lost", "cancelled", "shutdown") or result is None:
+            log("job_abandoned", job=self.id, reason=self.abort)
+        else:
+            result.update(runner_id=self.cfg.runner_id, lease_token=self.lease_token,
+                          timings=self.timings, attempt=self.attempt, aborted=self.abort)
+            for i in range(5):
+                try:
+                    code, body = self.api.call("POST", "/api/cpu/jobs/%s/result" % self.id, result, timeout=30)
+                    log("result_posted", job=self.id, http=code, exit_code=result["exit_code"],
+                        timed_out=result["timed_out"], timings=self.timings)
+                    break
+                except Exception as e:
+                    log("result_post_error", job=self.id, error=str(e), try_=i)
+                    time.sleep(2 ** i)
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+
+def _tail(path, n):
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            sz = f.tell()
+            f.seek(max(0, sz - n))
+            return f.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def _node_major():
+    try:
+        return subprocess.run(["node", "-v"], capture_output=True, text=True, timeout=10).stdout.strip().split(".")[0]
+    except Exception:
+        return "nonode"
+
+
+def _safe_extract(tf, dest):
+    base = os.path.realpath(dest)
+    for m in tf.getmembers():
+        tgt = os.path.realpath(os.path.join(dest, m.name))
+        if not (tgt == base or tgt.startswith(base + os.sep)):
+            raise RuntimeError("unsafe tar member %r" % m.name)
+        if m.islnk() or m.issym():
+            lt = os.path.realpath(os.path.join(os.path.dirname(tgt), m.linkname))
+            if m.islnk():
+                lt = os.path.realpath(os.path.join(dest, m.linkname))
+            if not (lt == base or lt.startswith(base + os.sep)):
+                raise RuntimeError("unsafe tar link %r" % m.name)
+    tf.extractall(dest)
+
+
+# ------------------------------------------------------------------ main loop
+class Agent:
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.api = Api(cfg)
+        self.stop = threading.Event()
+        self.active = {}  # thread name -> Job
+        self.iso = None
+
+    def touch_health(self):
+        try:
+            with open(self.cfg.health_file, "w") as f:
+                f.write(str(time.time()))
+        except OSError:
+            pass
+
+    def setup(self):
+        for d in (self.cfg.cache_dir, self.cfg.work_dir):
+            os.makedirs(d, exist_ok=True)
+        if am_root():
+            uid, gid = job_ids(self.cfg)
+            for d in (self.cfg.cache_dir, self.cfg.work_dir):
+                os.chown(d, uid, gid)
+            # stale job dirs from a crashed previous run
+            for n in os.listdir(self.cfg.work_dir):
+                shutil.rmtree(os.path.join(self.cfg.work_dir, n), ignore_errors=True)
+        self.iso = probe_isolation(self.cfg)
+        if self.cfg.isolation == "required" and not self.iso:
+            log("fatal", error="network isolation required but unavailable (need CAP_SYS_ADMIN+NET_ADMIN, "
+                               "see README troubleshooting); set CPU_RUNNER_ISOLATION=none only for tests")
+            return False
+        if self.cfg.isolation == "auto" and not self.iso:
+            log("warning", error="NETWORK ISOLATION UNAVAILABLE - jobs run with network")
+        log("start", version=VERSION, runner=self.cfg.runner_id, concurrency=self.cfg.concurrency,
+            isolation=self.iso or self.cfg.isolation, api=self.cfg.api)
+        return True
+
+    def worker(self):
+        cfg = self.cfg
+        while not self.stop.is_set():
+            self.touch_health()
+            try:
+                code, body = self.api.call("POST", "/api/cpu/claim",
+                                           {"runner_id": cfg.runner_id, "lease_s": cfg.lease_s}, timeout=15)
+            except Exception as e:
+                log("claim_error", error=str(e))
+                self.stop.wait(min(30, cfg.poll_s * 3))
+                continue
+            if code != 200 or not body or not body.get("job"):
+                self.stop.wait(cfg.poll_s)
+                continue
+            claim = body["job"]
+            log("claimed", job=claim["id"], attempt=claim.get("attempt"), stage=claim["spec"].get("stage"))
+            job = Job(cfg, self.api, claim, self.iso)
+            self.active[threading.current_thread().name] = job
+            try:
+                job.run()
+            except Exception as e:  # never let the worker thread die
+                log("worker_error", error=str(e))
+            finally:
+                self.active.pop(threading.current_thread().name, None)
+
+    def run(self):
+        if not self.setup():
+            return 3
+        signal.signal(signal.SIGTERM, lambda *_: self.stop.set())
+        signal.signal(signal.SIGINT, lambda *_: self.stop.set())
+        threads = [threading.Thread(target=self.worker, name="w%d" % i) for i in range(self.cfg.concurrency)]
+        for t in threads:
+            t.start()
+        while not self.stop.is_set():
+            self.touch_health()
+            self.stop.wait(5)
+        log("shutdown_begin", active=len(self.active), grace_s=self.cfg.shutdown_grace_s)
+        deadline = time.time() + self.cfg.shutdown_grace_s
+        for t in threads:
+            t.join(max(0, deadline - time.time()))
+        for name, job in list(self.active.items()):
+            job.abort = "shutdown"
+            job.kill()
+            try:  # hand the job back immediately instead of waiting for lease expiry
+                self.api.call("POST", "/api/cpu/jobs/%s/release" % job.id,
+                              {"runner_id": self.cfg.runner_id, "lease_token": job.lease_token}, timeout=5)
+            except Exception:
+                pass
+        for t in threads:
+            t.join(15)
+        log("shutdown_done")
+        return 0
+
+
+def selftest(cfg):
+    """Prove isolation inside the real container: a job must see only lo, no route out,
+    not be root, and carry no capabilities."""
+    cfg.isolation = "required"
+    flags = probe_isolation(cfg)
+    if not flags:
+        print("FAIL: cannot create an empty network namespace")
+        return 1
+    script = ("import socket,os,sys\n"
+              "r={}\n"
+              "r['uid']=os.getuid()\n"
+              "r['ifaces']=sorted(os.listdir('/sys/class/net'))\n"
+              "for host in ('1.1.1.1','10.0.0.1'):\n"
+              "  try: socket.create_connection((host,53),3); r[host]='REACHABLE'\n"
+              "  except OSError as e: r[host]='blocked'\n"
+              "try: socket.getaddrinfo('example.com',80); r['dns']='RESOLVED'\n"
+              "except OSError: r['dns']='blocked'\n"
+              "s=socket.socket(); s.bind(('127.0.0.1',0)); r['loopback']='ok'\n"
+              "print(r, open('/proc/self/status').read().split('CapEff:')[1].split()[0])\n")
+    out = subprocess.run(isolation_prefix(cfg, flags) + ["python3", "-c", script], capture_output=True, text=True)
+    print(out.stdout.strip(), out.stderr.strip()[-300:])
+    ok = ("REACHABLE" not in out.stdout and "RESOLVED" not in out.stdout and "'ifaces': ['lo']" in out.stdout
+          and "'loopback': 'ok'" in out.stdout and out.stdout.strip().endswith("0000000000000000")
+          and (not am_root() or "'uid': 0" not in out.stdout))
+    print("PASS" if ok else "FAIL")
+    return 0 if ok else 1
+
+
+def healthcheck(cfg):
+    try:
+        age = time.time() - float(open(cfg.health_file).read())
+    except Exception:
+        return 1
+    return 0 if age < 90 else 1
+
+
+def main(argv):
+    cfg = Config()
+    cmd = argv[1] if len(argv) > 1 else "run"
+    if cmd == "run":
+        return Agent(cfg).run()
+    if cmd == "selftest":
+        return selftest(cfg)
+    if cmd == "healthcheck":
+        return healthcheck(cfg)
+    print("usage: agent.py [run|selftest|healthcheck]")
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
