@@ -255,6 +255,15 @@ def priv_drop_prefix(cfg):
             "--bounding-set=-all", "--inh-caps=-all", "--no-new-privs"]
 
 
+# Kernel-created fallback tunnel devices (appear, DOWN and address-less, in every new netns when the tunnel
+# modules are loaded, e.g. Unraid's tunl0). They have no route out; real reachability is tested by selftest.
+FALLBACK_TUNNEL_IFACES = {"tunl0", "sit0", "ip6tnl0", "ip6gre0", "gre0", "gretap0", "erspan0", "ip_vti0", "ip6_vti0"}
+
+
+def only_loopback(ifaces):
+    return "lo" in ifaces and not (set(ifaces) - {"lo"} - FALLBACK_TUNNEL_IFACES)
+
+
 NET_FLAGS_FULL = ["unshare", "--net", "--pid", "--fork", "--kill-child"]
 NET_FLAGS_MIN = ["unshare", "--net"]
 LO_UP = 'ip link set lo up 2>/dev/null; exec "$@"'
@@ -281,7 +290,7 @@ def probe_isolation(cfg):
             log("isolation_probe_error", flags=flags, error=str(e))
             continue
         ifs = r.stdout.split()
-        if r.returncode == 0 and ifs == ["lo"]:
+        if r.returncode == 0 and only_loopback(ifs):
             return flags
         log("isolation_probe_failed", flags=flags, rc=r.returncode, ifaces=ifs, err=r.stderr[-200:])
     return None
@@ -834,6 +843,12 @@ def selftest(cfg):
     return 0 if ok else 1
 
 
+def _ifaces_ok(stdout):
+    import re
+    m = re.search(r"'ifaces': \[([^\]]*)\]", stdout)
+    return bool(m) and only_loopback([x.strip().strip("'\"") for x in m.group(1).split(",") if x.strip()])
+
+
 def selftest_run(cfg):
     """Prove isolation inside the real container: a job must see only lo, no route out,
     not be root, and carry no capabilities. Returns (ok, detail)."""
@@ -854,7 +869,7 @@ def selftest_run(cfg):
               "print(r, open('/proc/self/status').read().split('CapEff:')[1].split()[0])\n")
     out = subprocess.run(isolation_prefix(cfg, flags) + ["python3", "-c", script], capture_output=True, text=True)
     text = (out.stdout.strip() + " " + out.stderr.strip()[-300:]).strip()
-    ok = ("REACHABLE" not in out.stdout and "RESOLVED" not in out.stdout and "'ifaces': ['lo']" in out.stdout
+    ok = ("REACHABLE" not in out.stdout and "RESOLVED" not in out.stdout and _ifaces_ok(out.stdout)
           and "'loopback': 'ok'" in out.stdout and out.stdout.strip().endswith("0000000000000000")
           and (not am_root() or "'uid': 0" not in out.stdout))
     return ok, text
