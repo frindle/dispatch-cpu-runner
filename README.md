@@ -1,5 +1,42 @@
 # dispatch-cpu-runner
 
+## Deploy in one step
+Mac (once; also what `update.sh` does first): `./update.sh` (or `bash scripts/provision.sh`). It copies the build
+context to `/Volumes/data/dispatch-cpu-runner`, writes `secrets/token` from the Mac's token file (creating that file if absent),
+and writes `.env` with the Mac's LAN URL filled in. No hand-editing, ever.
+
+Unraid (web terminal), the only command:
+
+    cd /mnt/user/data/dispatch-cpu-runner && bash deploy.sh
+
+`deploy.sh` checks docker/compose, verifies `secrets/token` and `.env` exist (else it says to run provision on the Mac), builds,
+starts, waits for the container to be healthy, runs the isolation selftest, and prints a PASS/FAIL summary (isolation, queue
+API reachable, token accepted). If namespace creation fails it tells you to run `bash deploy.sh --relax-seccomp` (adds
+`docker-compose.override.yml` with `seccomp=unconfined`; the main compose is never edited). The container also runs the selftest and an
+API/token check by itself at every start (see `docker logs dispatch-cpu-runner`: events `selftest`, `api_ok` / `token_rejected`),
+and the Docker healthcheck goes unhealthy if the selftest failed or the token is rejected.
+Missing token inside the container: it exits with a one-line pointer to `scripts/provision.sh` (it never invents a token).
+
+## Update in one step
+Mac: `./update.sh`. It re-runs provision (rsync of the latest code; refreshes only `CPU_RUNNER_API` in `.env` if the Mac IP
+changed). The agent code is **bind-mounted** (`./agent:/opt/runner:ro`), not baked into the image: the running agent
+hashes its own file, and on a change that compiles it stops claiming, lets leased jobs finish (heartbeats continue; after
+`CPU_RUNNER_RELOAD_GRACE_S`=1800 s leftovers are released back to the queue), then re-execs itself. Zero downtime, no Unraid step.
+Only when `Dockerfile`, `docker-compose.yml` or `.env` changed does `update.sh` print `REBUILD NEEDED` with the single
+command to run on Unraid (`bash deploy.sh`, idempotent, same as deploy). `./update.sh --restart` additionally restarts the container via
+the Unraid GraphQL API (key read from `~/.claude.json`, never printed; it does not apply compose/.env changes).
+Why not a rebuilding sidecar: that needs the docker socket (= root on the host), which we deliberately do not mount.
+
+### Security model
+- The shared token lives in `~/.config/dispatch-cpu-runner/token` (0600) on the Mac and `secrets/token` (0600) on the data share;
+  mounted into the container as a compose secret file. It is never in git (`secrets/`, `.env` are gitignored), never in `.env`,
+  never printed by the scripts (they print sizes/modes only), and jobs never see it (clean job environment).
+- The data share is reachable by anyone with access to that SMB share: keep the `data` share private (not public/guest) since it holds the token.
+  Rotating: delete the Mac token file, run `update.sh` (a new one is created and copied), then `bash deploy.sh` or `./update.sh --restart`.
+- The queue API is LAN-only: `/api/cpu/*` rejects proxied/Cloudflare requests and checks the bearer token itself; the container
+  calls out to the Mac's LAN IP:7684, nothing listens on Unraid. No docker socket is mounted.
+- Isolation stays fail-closed (`CPU_RUNNER_ISOLATION=required`).
+
 Purpose-built Unraid container that runs the dispatch pipeline's CPU-only stages
 (baseline/final verify, preflight both-ways verify, relevance mutation, harness
 self-check, slicer scaffolding) so they stop idling the GPU lanes. Phase 6 of
@@ -27,7 +64,8 @@ isolation can only be proven inside the container (`selftest`), see "Isolation".
 - `agent/agent.py` the runner (claim loop x N threads, heartbeat, deps cache, isolation, results)
 - `client/cpu_job.py` `submit_cpu_job(...)` for the queue side (+ local fallback)
 - `reference/queue_server.py` in-memory reference implementation of the API (port this into the queue)
-- `tests/test_e2e.py` 14 tests; `scripts/sandbox-e2e.sh` runs them on claude-sandbox and cleans up
+- `tests/test_e2e.py` 14 tests + `tests/test_deploy.py` (provision idempotency, token never printed, .env refresh, token handling, self-reload without dropping a job); `scripts/sandbox-e2e.sh` runs them on claude-sandbox and cleans up
+- `scripts/provision.sh` (Mac sync + secrets + .env), `update.sh` (Mac), `deploy.sh` (Unraid), `scripts/unraid_restart.py`
 - `Dockerfile`, `docker-compose.yml`, `env.example`
 
 ## Design
@@ -69,29 +107,16 @@ containers. Chosen over `docker run --network none` per job (needs the docker so
 if the wrapper does not produce a namespace containing only `lo`. `selftest` asserts: only `lo`, 1.1.1.1 and a LAN IP
 unreachable, DNS fails, loopback bind works, uid != 0, CapEff = 0.
 **Verification status**: claude-sandbox is itself a container whose seccomp blocks `unshare`, so only the
-fail-closed behaviour and command shape were tested there. Run `selftest` on Unraid (step 4 below).
-Troubleshooting: if selftest cannot create a namespace, uncomment `seccomp=unconfined` in the compose.
+fail-closed behaviour and command shape were tested there. The container runs `selftest` itself at start (and `deploy.sh` re-runs it).
+Troubleshooting: if it cannot create a namespace, run `bash deploy.sh --relax-seccomp`.
 The dependency-install phase has network (it must) and runs as the unprivileged user.
 
-## Steps for Penn on Unraid
-The files are copied to `/mnt/user/data/dispatch-cpu-runner/` (if not already: copy this directory there, minus `.git`).
-0. On the Mac (already done once; idempotent): `python3 ~/bin/cpu_lane.py token` creates
-   `~/.config/dispatch-cpu-runner/token` (0600, random 32 bytes hex) if absent and prints its PATH only;
-   `python3 ~/bin/cpu_lane.py api-url` prints the exact `CPU_RUNNER_API` value (the Mac's LAN IP, discovered,
-   not the WARP tunnel address). The queue API (dashboard, :7684) must have been restarted once so it serves
-   `/api/cpu/*`; check from any LAN host: `curl http://<mac-lan-ip>:7684/api/cpu/health` -> `{"ok": true}`.
-1. Token: copy the Mac's token file to the data share WITHOUT printing it, e.g. on the Mac
-   `scp ~/.config/dispatch-cpu-runner/token <unraid>:/mnt/user/data/dispatch-cpu-runner/secrets/token`
-   (or paste via the Unraid file browser), then on Unraid `chmod 600 secrets/token`. It must be byte-identical
-   to the Mac file (a trailing newline is fine).
-2. `cp env.example .env`; set `CPU_RUNNER_API=` to the `api-url` output from step 0; adjust concurrency/limits.
-3. `docker compose up -d --build`
-4. `docker compose run --rm cpu-runner selftest` -> must print PASS. Then `docker logs -f dispatch-cpu-runner`
-   should show `start ... isolation: [unshare,...]`.
-Unraid macvlan/bridge: the container needs to reach the Mac's port 7684 (default bridge works). macOS may ask
-once to allow incoming connections for python (allow). Verify on the Mac: `python3 ~/bin/cpu_lane.py summary`
-shows the runner under `runners` (seen_s_ago < 120) and the dashboard "CPU lane" section reads "1 runner(s) online".
-Until a runner has polled in the last 120 s, `run_cpu_stage` runs every stage locally (no 3-minute claim wait).
+## Operations notes
+The Mac queue API (dashboard, :7684) must have been restarted once so it serves `/api/cpu/*`; check from any LAN host:
+`curl http://<mac-lan-ip>:7684/api/cpu/health` -> `{"ok": true}`. macOS may ask once to allow incoming connections for python (allow).
+Verify on the Mac: `python3 ~/bin/cpu_lane.py summary` shows the runner under `runners` (seen_s_ago < 120) and the dashboard
+"CPU lane" section reads "1 runner(s) online". Until a runner has polled in the last 120 s, `run_cpu_stage` runs every stage locally.
+Mac mount: `provision.sh` refuses to write if `/Volumes/data` is not a mounted share (Finder > Connect to Server > smb://<unraid>/data).
 
 ## Queue side (implemented in `~/bin`, mirrored in machine-config `bin/` + `docs/cpu-lane.md`)
 - `cpu_lane.py`: sqlite WAL store `~/.ollama-dispatch/cpu-jobs/jobs.sqlite` + blobs on disk (rows pruned after 7 d,

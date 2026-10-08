@@ -1,6 +1,6 @@
 # Deploy dir on Unraid: /mnt/user/data/dispatch-cpu-runner/   (build context = this dir)
-#   cp env.example .env && edit .env, put the shared token in ./secrets/token (chmod 600)
-#   docker compose up -d --build && docker compose run --rm cpu-runner selftest
+# Never edit by hand: on the Mac run scripts/provision.sh (secrets/token + .env are generated), then
+# on Unraid run ./deploy.sh. Updates: Mac `update.sh` (agent code is mounted, it self-reloads).
 services:
   cpu-runner:
     build: .
@@ -13,6 +13,7 @@ services:
       CPU_RUNNER_ID: unraid-cpu-1
     secrets: [cpu_runner_token]
     volumes:
+      - ./agent:/opt/runner:ro    # agent code mounted (not baked): update = rsync, agent re-execs itself
       - ./cache:/cache            # persistent npm + node_modules caches (data share)
       - cpu-runner-work:/work     # scratch checkouts; named volume (docker img storage), wiped at startup
     # ---- explicit resource limits (shared by all CPU_RUNNER_CONCURRENCY jobs) ----
@@ -23,8 +24,8 @@ services:
     # ---- privileges: only what the empty-netns + privilege-drop wrapper needs ----
     cap_drop: [ALL]
     cap_add: [SYS_ADMIN, NET_ADMIN, SETUID, SETGID, SETPCAP, CHOWN, DAC_OVERRIDE, FOWNER, KILL]
-    # If `selftest` says it cannot create a network namespace, uncomment:
-    # security_opt: ["seccomp=unconfined"]
+    # If the startup selftest cannot create a network namespace run `./deploy.sh --relax-seccomp`
+    # (writes docker-compose.override.yml; this file stays untouched).
     stop_grace_period: 45s
     init: true
     logging:

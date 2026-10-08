@@ -14,7 +14,7 @@ import base64, fnmatch, hashlib, io, json, os, pwd, shlex, shutil, signal, socke
 import subprocess, sys, tarfile, tempfile, threading, time, urllib.error, urllib.request
 import fcntl
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 
 def env(name, default=None, cast=str):
@@ -53,14 +53,31 @@ class Config:
         self.nice = env("CPU_RUNNER_NICE", 5, int)
         self.job_user = env("CPU_RUNNER_JOB_USER", "runner")
         self.health_file = env("CPU_RUNNER_HEALTH_FILE", "/tmp/cpu-runner.health")
+        self.status_file = env("CPU_RUNNER_STATUS_FILE", "/tmp/cpu-runner.status")
+        # code reload: the agent watches its own file; on change it drains (finishes leased jobs,
+        # up to reload_grace_s, then releases them) and re-execs itself. 0 disables.
+        self.reload_check_s = env("CPU_RUNNER_RELOAD_CHECK_S", 5.0, float)
+        self.reload_grace_s = env("CPU_RUNNER_RELOAD_GRACE_S", 1800, int)
 
-    @staticmethod
-    def _token():
+    def _token(self):
+        """Token from CPU_RUNNER_TOKEN_FILE (or CPU_RUNNER_TOKEN). Never invented: the Mac
+        shares it. A missing/empty source leaves token "" and sets token_error."""
+        self.token_error = None
         f = env("CPU_RUNNER_TOKEN_FILE")
         if f:
-            with open(f) as fh:
-                return fh.read().strip()
-        return env("CPU_RUNNER_TOKEN", "")
+            try:
+                with open(f) as fh:
+                    tok = fh.read().strip()
+            except OSError as e:
+                self.token_error = "cannot read token file %s (%s)" % (f, e.strerror or e)
+                return ""
+            if not tok:
+                self.token_error = "token file %s is empty" % f
+            return tok
+        tok = env("CPU_RUNNER_TOKEN", "")
+        if not tok:
+            self.token_error = "no CPU_RUNNER_TOKEN_FILE or CPU_RUNNER_TOKEN configured"
+        return tok
 
 
 def log(event, **kw):
@@ -496,8 +513,85 @@ class Agent:
         self.cfg = cfg
         self.api = Api(cfg)
         self.stop = threading.Event()
+        self.draining = threading.Event()   # code changed: finish current jobs, claim no more, re-exec
         self.active = {}  # thread name -> Job
         self.iso = None
+        self.status = {"selftest": "pending", "api": "unknown"}
+        self._src = os.path.abspath(__file__)
+        self._src_hash = self._hash_src()
+        self._bad_hash = None
+        self._cand = None
+
+    # ---- status / health
+    def set_status(self, **kw):
+        self.status.update(kw)
+        try:
+            with open(self.cfg.status_file, "w") as f:
+                json.dump(self.status, f)
+        except OSError:
+            pass
+
+    def _hash_src(self):
+        try:
+            with open(self._src, "rb") as f:
+                return hashlib.sha256(f.read()).hexdigest()
+        except OSError:
+            return None
+
+    def check_reload(self):
+        """True once the agent's own file has changed to something that compiles (seen twice in a
+        row, so a half-synced file is never acted on)."""
+        if not self.cfg.reload_check_s:
+            return False
+        h = self._hash_src()
+        if h is None or h == self._src_hash:
+            self._cand = None
+            return False
+        if h != self._cand:
+            self._cand = h          # debounce: require the same new hash on the next check
+            return False
+        if h == self._bad_hash:
+            return False
+        try:
+            with open(self._src, "rb") as f:
+                compile(f.read(), self._src, "exec")
+        except (SyntaxError, ValueError) as e:
+            self._bad_hash = h
+            log("reload_skipped", reason="new code does not compile", error=str(e)[:200])
+            return False
+        log("reload_detected", old=self._src_hash[:12], new=h[:12])
+        return True
+
+    def preflight_api(self):
+        """Startup self-check: API reachable, token accepted (cheap read-only authenticated call)."""
+        cfg = self.cfg
+        try:
+            code, _ = self.api.call("GET", "/api/cpu/health", timeout=10)
+        except Exception as e:
+            self.set_status(api="unreachable")
+            log("api_unreachable", api=cfg.api, error=str(e),
+                hint="check CPU_RUNNER_API in .env (re-run scripts/provision.sh on the Mac) and that the queue API is up")
+            return
+        if code != 200:
+            self.set_status(api="unhealthy")
+            log("api_unhealthy", api=cfg.api, http=code)
+            return
+        try:
+            code, _ = self.api.call("GET", "/api/cpu/runners", timeout=10)
+        except Exception as e:
+            self.set_status(api="unreachable")
+            log("api_unreachable", api=cfg.api, error=str(e))
+            return
+        if code in (401, 403):
+            self.set_status(api="token_rejected")
+            log("token_rejected", api=cfg.api, http=code,
+                hint="the token in secrets/token does not match the Mac; re-run scripts/provision.sh on the Mac, then ./deploy.sh")
+        elif code == 200:
+            self.set_status(api="ok")
+            log("api_ok", api=cfg.api, token="accepted")
+        else:
+            self.set_status(api="unhealthy")
+            log("api_unhealthy", api=cfg.api, http=code)
 
     def touch_health(self):
         try:
@@ -524,12 +618,23 @@ class Agent:
         if self.cfg.isolation == "auto" and not self.iso:
             log("warning", error="NETWORK ISOLATION UNAVAILABLE - jobs run with network")
         log("start", version=VERSION, runner=self.cfg.runner_id, concurrency=self.cfg.concurrency,
-            isolation=self.iso or self.cfg.isolation, api=self.cfg.api)
+            isolation=self.iso or self.cfg.isolation, api=self.cfg.api, code=(self._src_hash or "")[:12])
+        if self.cfg.isolation != "none":
+            ok, text = selftest_run(self.cfg)
+            self.set_status(selftest="PASS" if ok else "FAIL")
+            log("selftest", result="PASS" if ok else "FAIL", detail=text)
+            if not ok and self.cfg.isolation == "required":
+                log("fatal", error="startup selftest FAILED; refusing to run jobs (fail closed). "
+                                   "If it cannot create a network namespace, run ./deploy.sh --relax-seccomp")
+                return False
+        else:
+            self.set_status(selftest="skipped")
+        self.preflight_api()
         return True
 
     def worker(self):
         cfg = self.cfg
-        while not self.stop.is_set():
+        while not self.stop.is_set() and not self.draining.is_set():
             self.touch_health()
             try:
                 code, body = self.api.call("POST", "/api/cpu/claim",
@@ -538,6 +643,15 @@ class Agent:
                 log("claim_error", error=str(e))
                 self.stop.wait(min(30, cfg.poll_s * 3))
                 continue
+            if code in (401, 403):
+                if self.status.get("api") != "token_rejected":
+                    self.set_status(api="token_rejected")
+                    log("token_rejected", http=code, hint="re-run scripts/provision.sh on the Mac, then ./deploy.sh")
+                self.stop.wait(min(30, cfg.poll_s * 5))
+                continue
+            if self.status.get("api") != "ok" and code in (200, 204):
+                self.set_status(api="ok")
+                log("api_ok", api=cfg.api, token="accepted")
             if code != 200 or not body or not body.get("job"):
                 self.stop.wait(cfg.poll_s)
                 continue
@@ -560,9 +674,28 @@ class Agent:
         threads = [threading.Thread(target=self.worker, name="w%d" % i) for i in range(self.cfg.concurrency)]
         for t in threads:
             t.start()
+        reloading = False
+        tick = min(5.0, self.cfg.reload_check_s or 5.0)
         while not self.stop.is_set():
             self.touch_health()
-            self.stop.wait(5)
+            if self.check_reload():
+                reloading = True
+                break
+            self.stop.wait(tick)
+        if reloading:
+            # graceful: stop claiming, let leased jobs finish (heartbeats keep leases), then re-exec
+            self.draining.set()
+            log("reload_drain", active=len(self.active), grace_s=self.cfg.reload_grace_s)
+            deadline = time.time() + self.cfg.reload_grace_s
+            while any(t.is_alive() for t in threads) and not self.stop.is_set() and time.time() < deadline:
+                self.touch_health()
+                self.stop.wait(1)
+            if not any(t.is_alive() for t in threads) and not self.stop.is_set():
+                log("reload_exec", argv=sys.argv)
+                sys.stdout.flush()
+                os.execv(sys.executable, [sys.executable] + sys.argv)
+            log("reload_drain_timeout_or_stop", active=len(self.active))
+            self.stop.set()
         log("shutdown_begin", active=len(self.active), grace_s=self.cfg.shutdown_grace_s)
         deadline = time.time() + self.cfg.shutdown_grace_s
         for t in threads:
@@ -582,13 +715,19 @@ class Agent:
 
 
 def selftest(cfg):
+    ok, text = selftest_run(cfg)
+    print(text)
+    print("PASS" if ok else "FAIL")
+    return 0 if ok else 1
+
+
+def selftest_run(cfg):
     """Prove isolation inside the real container: a job must see only lo, no route out,
-    not be root, and carry no capabilities."""
+    not be root, and carry no capabilities. Returns (ok, detail)."""
     cfg.isolation = "required"
     flags = probe_isolation(cfg)
     if not flags:
-        print("FAIL: cannot create an empty network namespace")
-        return 1
+        return False, "cannot create an empty network namespace"
     script = ("import socket,os,sys\n"
               "r={}\n"
               "r['uid']=os.getuid()\n"
@@ -601,26 +740,40 @@ def selftest(cfg):
               "s=socket.socket(); s.bind(('127.0.0.1',0)); r['loopback']='ok'\n"
               "print(r, open('/proc/self/status').read().split('CapEff:')[1].split()[0])\n")
     out = subprocess.run(isolation_prefix(cfg, flags) + ["python3", "-c", script], capture_output=True, text=True)
-    print(out.stdout.strip(), out.stderr.strip()[-300:])
+    text = (out.stdout.strip() + " " + out.stderr.strip()[-300:]).strip()
     ok = ("REACHABLE" not in out.stdout and "RESOLVED" not in out.stdout and "'ifaces': ['lo']" in out.stdout
           and "'loopback': 'ok'" in out.stdout and out.stdout.strip().endswith("0000000000000000")
           and (not am_root() or "'uid': 0" not in out.stdout))
-    print("PASS" if ok else "FAIL")
-    return 0 if ok else 1
+    return ok, text
 
 
 def healthcheck(cfg):
+    """Healthy = loop heartbeat fresh AND startup selftest not failed AND token not rejected."""
     try:
         age = time.time() - float(open(cfg.health_file).read())
     except Exception:
         return 1
-    return 0 if age < 90 else 1
+    if age >= 90:
+        return 1
+    try:
+        st = json.load(open(cfg.status_file))
+    except Exception:
+        st = {}
+    if st.get("selftest") == "FAIL" or st.get("api") == "token_rejected":
+        print("unhealthy: %s" % st)
+        return 1
+    return 0
 
 
 def main(argv):
     cfg = Config()
     cmd = argv[1] if len(argv) > 1 else "run"
     if cmd == "run":
+        if not cfg.token:
+            sys.stderr.write("cpu-runner: no shared token (%s). Run scripts/provision.sh on the Mac, then ./deploy.sh here. "
+                             "The token is never generated on this side.\n" % cfg.token_error)
+            log("fatal", error="missing token: " + str(cfg.token_error), fix="run scripts/provision.sh on the Mac")
+            return 4
         return Agent(cfg).run()
     if cmd == "selftest":
         return selftest(cfg)
