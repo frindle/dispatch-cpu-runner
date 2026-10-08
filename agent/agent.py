@@ -451,8 +451,17 @@ class Job:
                         raise RuntimeError("prisma generate failed rc=%d: %s" % (r.returncode, _tail(out, 2000)))
                     info["prisma"] = True
                 os.makedirs(nm_cache, exist_ok=True)
+                # The agent is root; the cp below runs as the job user. A root-owned nm_cache made every
+                # cache fill fail with ENOENT on the rename (cp could not create tmp). Own it first.
+                if am_root():
+                    uid, gid = job_ids(self.cfg)
+                    if uid is not None:
+                        os.chown(nm_cache, uid, gid)
                 tmp = entry + ".tmp-%d-%s" % (os.getpid(), self.id[:8])
-                self.run_user(["cp", "-a", dest, tmp], pkg, env_, 600)
+                r = self.run_user(["cp", "-a", dest, tmp], pkg, env_, 600)
+                if r.returncode:
+                    shutil.rmtree(tmp, ignore_errors=True)
+                    raise RuntimeError("cache fill (cp node_modules) failed rc=%d" % r.returncode)
                 os.rename(tmp, entry)
                 self._prune(nm_cache)
         finally:
