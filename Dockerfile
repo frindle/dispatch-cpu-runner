@@ -1,4 +1,4 @@
-FROM node:22-bookworm-slim
+FROM node:26-bookworm-slim
 LABEL org.opencontainers.image.title="dispatch-cpu-runner" \
       org.opencontainers.image.description="Pull-based CPU job runner with per-job network-namespace isolation" \
       org.opencontainers.image.source="https://github.com/frindle/dispatch-cpu-runner" \
