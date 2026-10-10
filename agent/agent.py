@@ -16,7 +16,7 @@ import base64, fnmatch, re, hashlib, io, json, os, pwd, shlex, shutil, signal, s
 import subprocess, sys, tarfile, tempfile, threading, time, urllib.error, urllib.request
 import fcntl
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 
 def env(name, default=None, cast=str):
@@ -330,6 +330,9 @@ class Job:
              "HOME": os.path.join(self.dir, "home"), "TMPDIR": os.path.join(self.dir, "tmp"),
              "CI": "1", "LANG": "C.UTF-8", "JOB_TOOLS": os.path.join(self.dir, "tools"),
              "NPM_CONFIG_CACHE": os.path.join(self.cfg.cache_dir, "npm"),
+             # python jobs: a verify that bootstraps a venv with `pip install -r requirements.txt` must fail
+             # FAST offline (no 5 x backoff retries against a dead network) and fall back to the baked packages
+             "PIP_NO_INDEX": "1", "PIP_DISABLE_PIP_VERSION_CHECK": "1",
              "NODE_OPTIONS": self.cfg.node_options, "CPU_RUNNER_JOB_ID": self.id}
         return e
 
@@ -623,6 +626,36 @@ def _node_major():
         return "nonode"
 
 
+# Reported to the queue (claim body) so ITS eligibility check compares a stage's needs to what this image really
+# has, instead of a hardcoded guess. Runs the same `node` / `python3` a job gets (job PATH), not the agent's own
+# interpreter (the agent runs on Debian's python; jobs run on the baked job python).
+CAPS_VERSION = 1
+_PY_PROBE = ("import json,sys,importlib.metadata as m\n"
+             "print(json.dumps({'minor':'%d.%d'%sys.version_info[:2],'full':sys.version.split()[0],"
+             "'mods':sorted(m.packages_distributions())}))\n")
+
+
+def detect_caps(run=subprocess.run, which=shutil.which):
+    """{v, agent, node, node_full, python, python_full, py_modules, sqlite3, arch}; keys that cannot be probed are
+    omitted (the queue treats an absent capability as 'not available'). Never raises."""
+    caps = {"v": CAPS_VERSION, "agent": VERSION, "arch": os.uname().machine}
+    try:
+        nv = run(["node", "-v"], capture_output=True, text=True, timeout=10).stdout.strip()
+        if nv.startswith("v") and nv[1:].split(".")[0].isdigit():
+            caps["node_full"], caps["node"] = nv, int(nv[1:].split(".")[0])
+    except Exception:
+        pass
+    try:
+        r = run(["python3", "-c", _PY_PROBE], capture_output=True, text=True, timeout=30)
+        d = json.loads(r.stdout.strip().splitlines()[-1])
+        caps["python"], caps["python_full"] = str(d["minor"]), str(d["full"])
+        caps["py_modules"] = sorted({str(x) for x in d["mods"]})
+    except Exception:
+        pass
+    caps["sqlite3"] = which("sqlite3") is not None
+    return caps
+
+
 def _safe_extract(tf, dest):
     base = os.path.realpath(dest)
     for m in tf.getmembers():
@@ -635,7 +668,8 @@ def _safe_extract(tf, dest):
                 lt = os.path.realpath(os.path.join(dest, m.linkname))
             if not (lt == base or lt.startswith(base + os.sep)):
                 raise RuntimeError("unsafe tar link %r" % m.name)
-    tf.extractall(dest)
+    # members were validated above; python 3.12+ warns (3.14: errors on absolute/outside links) without a filter
+    tf.extractall(dest, **({"filter": "fully_trusted"} if hasattr(tarfile, "fully_trusted_filter") else {}))
 
 
 # ------------------------------------------------------------------ main loop
@@ -652,6 +686,8 @@ class Agent:
         self._src_hash = self._hash_src()
         self._bad_hash = None
         self._cand = None
+        self.caps = {}
+        self._caps_sent = 0.0
 
     # ---- status / health
     def set_status(self, **kw):
@@ -760,16 +796,28 @@ class Agent:
                 return False
         else:
             self.set_status(selftest="skipped")
+        self.caps = detect_caps()
+        log("caps", **self.caps)
         self.preflight_api()
         return True
+
+    CAPS_RESEND_S = 60      # the queue treats caps older than ~3 min as stale, so a downgraded (old) image ages out
+
+    def claim_body(self):
+        body = {"runner_id": self.cfg.runner_id, "lease_s": self.cfg.lease_s}
+        if self.caps and time.time() - self._caps_sent >= self.CAPS_RESEND_S:
+            body["caps"] = self.caps
+        return body
 
     def worker(self):
         cfg = self.cfg
         while not self.stop.is_set() and not self.draining.is_set():
             self.touch_health()
             try:
-                code, body = self.api.call("POST", "/api/cpu/claim",
-                                           {"runner_id": cfg.runner_id, "lease_s": cfg.lease_s}, timeout=15)
+                cb = self.claim_body()
+                code, body = self.api.call("POST", "/api/cpu/claim", cb, timeout=15)
+                if "caps" in cb and code in (200, 204):
+                    self._caps_sent = time.time()
             except Exception as e:
                 log("claim_error", error=str(e))
                 self.stop.wait(min(30, cfg.poll_s * 3))

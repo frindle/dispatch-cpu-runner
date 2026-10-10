@@ -18,6 +18,7 @@ class Store:
         self.jobs, self.order = {}, []
         self.lock = threading.Lock()
         self.runner_seen = {}
+        self.runner_caps = {}       # runner_id -> last capability report (claim body `caps`)
         self.codes = set()          # live single-use enrollment codes
         self.config = {"concurrency": 2, "lease_s": 60}
         self.enrolled = []
@@ -90,6 +91,8 @@ class H(BaseHTTPRequestHandler):
             if method == "POST" and path == "/api/cpu/claim":
                 b = self._json()
                 S.runner_seen[b.get("runner_id")] = S.clock()
+                if isinstance(b.get("caps"), dict):
+                    S.runner_caps[b.get("runner_id")] = b["caps"]
                 for jid in S.order:
                     j = S.jobs[jid]
                     if j["status"] == "pending" and not j["cancel"]:

@@ -43,7 +43,8 @@ jobs:
           labels: |
             org.opencontainers.image.source=https://github.com/frindle/dispatch-cpu-runner
             org.opencontainers.image.licenses=MIT
-      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+      - id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           platforms: linux/amd64,linux/arm64
@@ -52,3 +53,9 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      - name: Smoke the pushed image (job python + node + agent caps)
+        run: |
+          img=ghcr.io/frindle/dispatch-cpu-runner@${{ steps.build.outputs.digest }}
+          docker run --rm --entrypoint python3 "$img" -c "import sys,sqlite3,ssl,flask,requests,paramiko; assert sys.version_info[:2]==(3,14), sys.version; print('job python', sys.version.split()[0])"
+          docker run --rm --entrypoint node "$img" -v
+          docker run --rm --entrypoint /usr/bin/python3 "$img" -c "import runpy,json; m=runpy.run_path('/opt/runner/agent.py'); c=m['detect_caps'](); print(json.dumps(c)); assert c['python']=='3.14' and c['node']==26 and c['sqlite3'] and 'flask' in c['py_modules'], c"

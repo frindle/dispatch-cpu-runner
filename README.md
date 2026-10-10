@@ -3,7 +3,16 @@
 A small, security-conscious **CPU job runner** you run as a container. It polls a job-queue API on your LAN, checks the
 job's git bundle out into a scratch dir, installs dependencies (cached), runs the job's command **inside an empty network
 namespace as an unprivileged user** (no network, no capabilities), and posts the exit code and output tails back. Python
-standard library only; Node 22 in the image for JavaScript jobs.
+standard library only; Node 26 for JavaScript jobs and a pinned python 3.14 (+ `requirements-runner.txt` packages, sqlite3 CLI)
+for python jobs. The agent itself runs on Debian's python.
+
+### Capabilities (what the queue may ship here)
+On its first claim and every 60 s the agent sends `caps` in the claim body: `{v, agent, arch, node, node_full, python,
+python_full, py_modules[], sqlite3}` (probed with the same `node`/`python3` a job gets). The queue keeps the latest report
+per runner and serves it on `GET /api/cpu/runners`; it treats caps older than about 3 minutes as absent, so an older image
+that stops reporting cannot inherit them. The queue compares a stage's needs (node >= 23 for `mock.module`, the python
+minor, third-party imports vs `py_modules`, sqlite3) with these instead of hard-coding the image. Jobs have no network and
+`PIP_NO_INDEX=1`: add a python package by editing `requirements-runner.txt` and updating the container.
 
 It is a pull-based worker for a queue **you provide**: it needs a queue API that implements the contract below (a reference
 implementation is in `reference/queue_server.py`) and a shared token that the queue issues to the runner through a one-time
@@ -148,7 +157,7 @@ Enrollment and config (agent, see "Enrollment"):
 - `GET config` -> `{config: {concurrency, lease_s, max_job_timeout_s, cache_max_entries, node_options}}`; explicit env vars on the runner win; `isolation` is never remote.
 
 Runner (agent):
-- `POST claim` `{runner_id, lease_s}` -> 200 `{job:{id, spec(+has_patch,has_tools), attempt, lease_token}}` or 204.
+- `POST claim` `{runner_id, lease_s, caps?}` (`caps`: capability report, see "Capabilities"; optional, unknown fields are ignored) -> 200 `{job:{id, spec(+has_patch,has_tools), attempt, lease_token}}` or 204.
   Atomic; picks oldest `pending`; sets lease_expires = now + lease_s.
 - `GET jobs/<id>/payload|patch|tools` -> bytes
 - `POST jobs/<id>/heartbeat` `{runner_id, lease_token, lease_s}` -> 200 `{cancel: bool}`; 409 if lease_token no longer holds
