@@ -33,7 +33,7 @@ class Config:
         self.enroll_code = (env("CPU_RUNNER_ENROLL_CODE", "") or "").strip()
         self.token = self._token()
         self.runner_id = env("CPU_RUNNER_ID", socket.gethostname())
-        self.concurrency = env("CPU_RUNNER_CONCURRENCY", 2, int)
+        self.concurrency = max(1, env("CPU_RUNNER_CONCURRENCY", 5, int))
         self.cache_dir = env("CPU_RUNNER_CACHE", "/cache")
         self.work_dir = env("CPU_RUNNER_WORK", "/work")
         self.poll_s = env("CPU_RUNNER_POLL_S", 3.0, float)
@@ -64,7 +64,7 @@ class Config:
         self.reload_grace_s = env("CPU_RUNNER_RELOAD_GRACE_S", 1800, int)
 
     # remote-tunable settings: API key -> (attr, env var that overrides it, cast, lo, hi)
-    REMOTE = {"concurrency": ("concurrency", "CPU_RUNNER_CONCURRENCY", int, 1, 16),
+    REMOTE = {"concurrency": ("concurrency", "CPU_RUNNER_CONCURRENCY", int, 1, 32),
               "lease_s": ("lease_s", "CPU_RUNNER_LEASE_S", int, 15, 600),
               "max_job_timeout_s": ("max_job_timeout_s", "CPU_RUNNER_MAX_TIMEOUT_S", int, 30, 21600),
               "cache_max_entries": ("cache_max_entries", "CPU_RUNNER_CACHE_MAX", int, 1, 64),
@@ -126,6 +126,9 @@ class Config:
         self.token_error = ("no token: CPU_RUNNER_TOKEN_FILE %s not found, CPU_RUNNER_TOKEN unset, nothing stored in %s"
                             % (f, self.state_dir)) if f else ("no token: CPU_RUNNER_TOKEN unset, nothing stored in %s" % self.state_dir)
         return ""
+
+
+PRUNE_PROTECT_S = 600     # node_modules cache entries touched this recently are never evicted (concurrent jobs)
 
 
 def log(event, **kw):
@@ -478,6 +481,10 @@ class Job:
         try:
             ents = [os.path.join(nm_cache, n) for n in os.listdir(nm_cache) if ".tmp-" not in n]
             ents.sort(key=lambda p: os.stat(p).st_mtime)
+            # Concurrent jobs: never evict an entry another job is (or just was) copying from. A hit touches the
+            # entry (os.utime), so "recent mtime" == "possibly in use".
+            now = time.time()
+            ents = [p for p in ents if now - os.stat(p).st_mtime > PRUNE_PROTECT_S]
             for p in ents[:max(0, len(ents) - self.cfg.cache_max_entries)]:
                 shutil.rmtree(p, ignore_errors=True)
                 log("cache_evict", path=p)
@@ -804,7 +811,7 @@ class Agent:
     CAPS_RESEND_S = 60      # the queue treats caps older than ~3 min as stale, so a downgraded (old) image ages out
 
     def claim_body(self):
-        body = {"runner_id": self.cfg.runner_id, "lease_s": self.cfg.lease_s}
+        body = {"runner_id": self.cfg.runner_id, "lease_s": self.cfg.lease_s, "slots": self.cfg.concurrency}
         if self.caps and time.time() - self._caps_sent >= self.CAPS_RESEND_S:
             body["caps"] = self.caps
         return body
@@ -835,7 +842,7 @@ class Agent:
                 self.stop.wait(cfg.poll_s)
                 continue
             claim = body["job"]
-            log("claimed", job=claim["id"], attempt=claim.get("attempt"), stage=claim["spec"].get("stage"))
+            log("claimed", slot=threading.current_thread().name, active=len(self.active) + 1, job=claim["id"], attempt=claim.get("attempt"), stage=claim["spec"].get("stage"))
             job = Job(cfg, self.api, claim, self.iso)
             self.active[threading.current_thread().name] = job
             try:

@@ -152,12 +152,15 @@ def run_local(worktree, cmd, timeout_s, cwd_rel=None, env=None, tail_bytes=65536
 
 def submit_cpu_job(worktree_path, cmd, timeout_s=600, *, cwd_rel=None, env=None, stage=None, label=None,
                    bundle_id=None, tools=None, mode="bundle", api=None, token=None,
-                   claim_timeout_s=180, poll_s=2.0, fallback=True, max_wait_s=None, lockfile_hash=None):
+                   claim_timeout_s=180, poll_s=2.0, fallback=True, max_wait_s=None, lockfile_hash=None,
+                   should_abort=None):
     """Run `cmd` for a worktree on the CPU runner; return CpuJobResult.
 
     claim_timeout_s: if no runner claims the job within this long, cancel and run locally.
     max_wait_s: hard cap waiting for a claimed job (default timeout_s + 600).
     fallback=False raises RuntimeError instead of running locally.
+    should_abort: optional callable polled (~every 10s) while the job is still pending; a truthy return (a reason
+    string) cancels the job and takes the fallback -- e.g. the runner's heartbeat went stale while we queued.
     lockfile_hash: override the dep-cache key hint (default: sha256 of package-lock.json at cwd_rel).
     """
     api = api or os.environ.get("CPU_RUNNER_API")
@@ -206,12 +209,22 @@ def submit_cpu_job(worktree_path, cmd, timeout_s=600, *, cwd_rel=None, env=None,
         t0 = time.time()
         max_wait = max_wait_s or (timeout_s + 600)
         claimed_at = None
+        last_abort_chk = t0
         while True:
             code, st = _http(api, tok, "GET", "/api/cpu/jobs/%s" % job_id)
             s = (st or {}).get("status")
             if s in ("done", "failed_infra", "cancelled"):
                 break
             now = time.time()
+            if s == "pending" and should_abort is not None and now - last_abort_chk >= 10:
+                last_abort_chk = now
+                try:
+                    why_abort = should_abort()
+                except Exception:           # noqa: BLE001 -- a broken probe must never fail the job
+                    why_abort = None
+                if why_abort:
+                    _http(api, tok, "DELETE", "/api/cpu/jobs/%s" % job_id)
+                    return fb(str(why_abort))
             if s == "pending" and now - t0 > claim_timeout_s:
                 _http(api, tok, "DELETE", "/api/cpu/jobs/%s" % job_id)
                 return fb("no runner claimed within %ss" % claim_timeout_s)

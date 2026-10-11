@@ -67,8 +67,8 @@ A pasted `CPU_RUNNER_TOKEN` is a fallback only; it is never rotated for you.
 ### Settings pulled from the queue
 `concurrency`, `lease_s`, `max_job_timeout_s`, `cache_max_entries` and `node_options` are pulled from `GET /api/cpu/config`
 at start (queue host: `python3 ~/bin/cpu_lane.py config concurrency=3`, applied on next container start). Any env var
-set on the container wins, and isolation is never remote. Container limits (`--cpus=8 --memory=16g`, in Extra Parameters)
-bound the total; defaults are 2 runners, about 4 CPU / 8 GiB each.
+set on the container wins, and isolation is never remote. Container limits (`--cpus=16 --memory=40g`, in Extra Parameters)
+bound the total; defaults are 5 concurrent jobs sharing 16 CPUs / 40 GiB (about 3 CPU / 8 GiB each; `NODE_OPTIONS` heap 6 GiB worst case x 5 = 30 GiB fits). The runner reports `slots` on every claim; the queue derives busy/saturated per runner. The node_modules cache is flock-guarded per lockfile key, entries touched within 10 min are never evicted, and every job has its own checkout, so two stages of the same worktree never collide.
 
 ## Security
 - **The token** is the one secret. It is never in the image, the template, git or logs. It reaches the container over the
@@ -86,7 +86,7 @@ bound the total; defaults are 2 runners, about 4 CPU / 8 GiB each.
 - The queue API must be LAN-only and enforce the token itself.
 
 ## Sizing
-Defaults: 2 concurrent jobs, container limit 8 CPUs / 16 GiB, `NODE_OPTIONS=--max-old-space-size` per job, jobs `nice`d (5).
+Defaults: 5 concurrent jobs (raised from 2 on 2026-10-10; the host is 44 cores / 88 threads / 256 GiB), container limit 16 CPUs / 40 GiB, `NODE_OPTIONS=--max-old-space-size` per job, jobs `nice`d (5).
 Scale by raising concurrency, `--cpus` and `--memory` together.
 
 ## Layout

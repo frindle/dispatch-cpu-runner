@@ -20,9 +20,9 @@ services:
         ipv4_address: ${CPU_RUNNER_IP:-10.0.12.52}
     mac_address: ${CPU_RUNNER_MAC:-02:70:0A:00:0C:34}
     # ---- explicit resource limits (shared by all CPU_RUNNER_CONCURRENCY jobs) ----
-    cpus: ${CPU_RUNNER_CPUS:-8}
-    mem_limit: ${CPU_RUNNER_MEM:-16g}
-    memswap_limit: ${CPU_RUNNER_MEM:-16g}
+    cpus: ${CPU_RUNNER_CPUS:-16}
+    mem_limit: ${CPU_RUNNER_MEM:-40g}
+    memswap_limit: ${CPU_RUNNER_MEM:-40g}
     pids_limit: 4096
     # ---- privileges: only what the empty-netns + privilege-drop wrapper needs ----
     cap_drop: [ALL]

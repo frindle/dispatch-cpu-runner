@@ -14,7 +14,7 @@
   <WebUI/>
   <TemplateURL>https://raw.githubusercontent.com/frindle/dispatch-cpu-runner/main/unraid/dispatch-cpu-runner.xml</TemplateURL>
   <Icon>https://raw.githubusercontent.com/frindle/dispatch-cpu-runner/main/unraid/icon.png</Icon>
-  <ExtraParams>--restart=unless-stopped --init --stop-timeout=45 --mac-address=02:70:0A:00:0C:34 --cpus=8 --memory=16g --memory-swap=16g --pids-limit=4096 --cap-drop=ALL --cap-add=SYS_ADMIN --cap-add=NET_ADMIN --cap-add=SETUID --cap-add=SETGID --cap-add=SETPCAP --cap-add=CHOWN --cap-add=DAC_OVERRIDE --cap-add=FOWNER --cap-add=KILL --log-opt max-size=20m --log-opt max-file=3</ExtraParams>
+  <ExtraParams>--restart=unless-stopped --init --stop-timeout=45 --mac-address=02:70:0A:00:0C:34 --cpus=16 --memory=40g --memory-swap=40g --pids-limit=4096 --cap-drop=ALL --cap-add=SYS_ADMIN --cap-add=NET_ADMIN --cap-add=SETUID --cap-add=SETGID --cap-add=SETPCAP --cap-add=CHOWN --cap-add=DAC_OVERRIDE --cap-add=FOWNER --cap-add=KILL --log-opt max-size=20m --log-opt max-file=3</ExtraParams>
   <PostArgs/>
   <CPUset/>
   <DateInstalled/>
