@@ -48,9 +48,10 @@ class TestDetectCaps(unittest.TestCase):
 class TestClaimBody(unittest.TestCase):
     def test_caps_sent_first_then_only_every_resend_interval(self):
         a = agent_mod.Agent.__new__(agent_mod.Agent)
-        a.cfg = type("C", (), {"runner_id": "r", "lease_s": 60})()
+        a.cfg = type("C", (), {"runner_id": "r", "lease_s": 60, "concurrency": 5})()
         a.caps, a._caps_sent = {"node": 26}, 0.0
         self.assertEqual(a.claim_body()["caps"], {"node": 26})
+        self.assertEqual(a.claim_body()["slots"], 5)   # saturation signal for the queue
         a._caps_sent = time.time()
         self.assertNotIn("caps", a.claim_body())
         a._caps_sent = time.time() - agent_mod.Agent.CAPS_RESEND_S - 1
