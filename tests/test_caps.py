@@ -45,6 +45,26 @@ class TestDetectCaps(unittest.TestCase):
         self.assertIn("py_modules", c)
 
 
+class TestImageRecipe(unittest.TestCase):
+    """The image's requirements must cover what dispatch python stages import (the queue refuses uncovered stages)."""
+    def test_requirements_cover_dispatch_project_imports(self):
+        with open(os.path.join(ROOT, "requirements-runner.txt")) as fh:
+            pins = {l.split("==")[0].strip().lower().replace("_", "-") for l in fh if l.strip() and not l.startswith("#")}
+        for pkg in ("fastapi", "pydantic", "starlette", "httpx", "pytest", "uvicorn", "pyyaml", "flask", "requests", "paramiko"):
+            self.assertIn(pkg, pins)
+
+    def test_py_modules_come_from_installed_distributions_not_a_list(self):
+        src = open(os.path.join(ROOT, "agent", "agent.py")).read()
+        self.assertIn("packages_distributions", src)
+
+    def test_reported_import_names_include_new_modules(self):
+        mods = ["fastapi", "pydantic", "starlette", "httpx", "pytest", "uvicorn", "yaml"]
+        probe = json.dumps({"minor": "3.14", "full": "3.14.8", "mods": mods})
+        c = agent_mod.detect_caps(run=FakeRun({"python3": probe}), which=lambda n: "/usr/bin/" + n)
+        for m in mods:
+            self.assertIn(m, c["py_modules"])
+
+
 class TestClaimBody(unittest.TestCase):
     def test_caps_sent_first_then_only_every_resend_interval(self):
         a = agent_mod.Agent.__new__(agent_mod.Agent)
