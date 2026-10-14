@@ -119,6 +119,14 @@ class TestImageRecipe(unittest.TestCase):
         names = {l.split("==")[0].lower() for l in lines}
         self.assertTrue({"flask", "requests", "paramiko"} <= names, names)
 
+    def test_fastapi_ships_with_its_form_runtime_dep(self):
+        # fastapi raises at import of any Form/File route without python-multipart; a static import scan
+        # (the queue's eligibility check) cannot see that, so the image must carry it whenever fastapi is baked
+        lines = [l.strip() for l in self.read("requirements-runner.txt").splitlines() if l.strip() and not l.startswith("#")]
+        names = {l.split("==")[0].lower() for l in lines}
+        if "fastapi" in names:
+            self.assertIn("python-multipart", names)
+
     def test_dockerignore_keeps_the_requirements_file(self):
         self.assertNotIn("requirements-runner.txt", self.read(".dockerignore"))
 
