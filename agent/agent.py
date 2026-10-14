@@ -742,30 +742,32 @@ class Agent:
         try:
             code, _ = self.api.call("GET", "/api/cpu/health", timeout=10)
         except Exception as e:
-            self.set_status(api="unreachable")
             log("api_unreachable", api=cfg.api, error=str(e),
                 hint="check CPU_RUNNER_API (the queue host's LAN URL) and that the queue API is running")
+            self.set_status(api="unreachable")
             return
         if code != 200:
-            self.set_status(api="unhealthy")
             log("api_unhealthy", api=cfg.api, http=code)
+            self.set_status(api="unhealthy")
             return
         try:
             code, _ = self.api.call("GET", "/api/cpu/runners", timeout=10)
         except Exception as e:
-            self.set_status(api="unreachable")
             log("api_unreachable", api=cfg.api, error=str(e))
+            self.set_status(api="unreachable")
             return
+        # log BEFORE publishing the status: anything that sees status api=ok / token_rejected
+        # (the health file, tests, an operator) can then rely on the event line already being out.
         if code in (401, 403):
-            self.set_status(api="token_rejected")
             log("token_rejected", api=cfg.api, http=code,
                 hint="token rejected (rotated?). Mint a new code on the queue host (cpu_lane.py enroll-code), set CPU_RUNNER_ENROLL_CODE, restart")
+            self.set_status(api="token_rejected")
         elif code == 200:
-            self.set_status(api="ok")
             log("api_ok", api=cfg.api, token="accepted")
+            self.set_status(api="ok")
         else:
-            self.set_status(api="unhealthy")
             log("api_unhealthy", api=cfg.api, http=code)
+            self.set_status(api="unhealthy")
 
     def touch_health(self):
         try:
@@ -831,13 +833,13 @@ class Agent:
                 continue
             if code in (401, 403):
                 if self.status.get("api") != "token_rejected":
-                    self.set_status(api="token_rejected")
                     log("token_rejected", http=code, hint="token rejected (rotated?). Mint a new code on the queue host (cpu_lane.py enroll-code), set CPU_RUNNER_ENROLL_CODE, restart")
+                    self.set_status(api="token_rejected")
                 self.stop.wait(min(30, cfg.poll_s * 5))
                 continue
             if self.status.get("api") != "ok" and code in (200, 204):
-                self.set_status(api="ok")
                 log("api_ok", api=cfg.api, token="accepted")
+                self.set_status(api="ok")
             if code != 200 or not body or not body.get("job"):
                 self.stop.wait(cfg.poll_s)
                 continue

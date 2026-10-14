@@ -153,7 +153,7 @@ def run_local(worktree, cmd, timeout_s, cwd_rel=None, env=None, tail_bytes=65536
 def submit_cpu_job(worktree_path, cmd, timeout_s=600, *, cwd_rel=None, env=None, stage=None, label=None,
                    bundle_id=None, tools=None, mode="bundle", api=None, token=None,
                    claim_timeout_s=180, poll_s=2.0, fallback=True, max_wait_s=None, lockfile_hash=None,
-                   should_abort=None):
+                   should_abort=None, owner=None):
     """Run `cmd` for a worktree on the CPU runner; return CpuJobResult.
 
     claim_timeout_s: if no runner claims the job within this long, cancel and run locally.
@@ -187,6 +187,8 @@ def submit_cpu_job(worktree_path, cmd, timeout_s=600, *, cwd_rel=None, env=None,
             hashlib.sha256(open(lock, "rb").read()).hexdigest()[:24] if os.path.exists(lock) else None)
         spec = {"cmd": cmd, "cwd": cwd_rel or ".", "timeout_s": int(timeout_s), "env": env or {},
                 "payload_kind": kind, "lockfile_hash": lock_hash, "stage": stage, "network": "none"}
+        if owner:        # additive display provenance (who submitted this stage); absent == old behaviour
+            spec["owner"] = str(owner)[:160]
         code, body = _http(api, tok, "POST", "/api/cpu/jobs",
                            {"spec": spec, "label": label, "stage": stage, "bundle_id": bundle_id})
         if code != 201:
