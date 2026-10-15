@@ -335,7 +335,7 @@ class Job:
              "NPM_CONFIG_CACHE": os.path.join(self.cfg.cache_dir, "npm"),
              # python jobs: a verify that bootstraps a venv with `pip install -r requirements.txt` must fail
              # FAST offline (no 5 x backoff retries against a dead network) and fall back to the baked packages
-             "PIP_NO_INDEX": "1", "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+             "PIP_NO_INDEX": "1", "PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD": "1", "PIP_DISABLE_PIP_VERSION_CHECK": "1",
              "NODE_OPTIONS": self.cfg.node_options, "CPU_RUNNER_JOB_ID": self.id}
         return e
 
@@ -409,13 +409,37 @@ class Job:
                 return None
             p = os.path.dirname(p)
 
+    def extra_pkg_dirs(self):
+        """Sub-package dirs (spec.extra_pkg_dirs, relative to the checkout) that carry their OWN package-lock.json
+        and need their own node_modules (e.g. sidecar/). Anything outside the checkout / without a lock is ignored."""
+        out = []
+        for rel in (self.spec.get("extra_pkg_dirs") or [])[:4]:
+            if not isinstance(rel, str) or not rel or os.path.isabs(rel):
+                continue
+            d = os.path.normpath(os.path.join(self.root, rel))
+            if d != self.root and d.startswith(self.root + os.sep) and os.path.isfile(os.path.join(d, "package-lock.json")):
+                out.append(d)
+        return out
+
     def deps(self):
         t0 = time.time()
         pkg = self.find_pkg_root()
         info = {"cache": "none"}
-        if pkg is None:
-            self.timings["deps"] = info
-            return
+        if pkg is not None:
+            self._install_pkg(pkg, info)
+        subs = []
+        for d in self.extra_pkg_dirs():
+            si = {"cache": "none"}
+            self._install_pkg(d, si)
+            subs.append(dict(si, dir=os.path.relpath(d, self.root)))
+        if subs:
+            info["sub"] = subs
+        info["seconds"] = round(time.time() - t0, 2)
+        self.timings["deps"] = info
+        log("deps", job=self.id, **info)
+
+    def _install_pkg(self, pkg, info):
+        t0 = time.time()
         h = hashlib.sha256()
         h.update(open(os.path.join(pkg, "package-lock.json"), "rb").read())
         for extra in ("prisma/schema.prisma", "package.json"):
@@ -474,8 +498,6 @@ class Job:
             fcntl.flock(lockf, fcntl.LOCK_UN)
             lockf.close()
         info["seconds"] = round(time.time() - t0, 2)
-        self.timings["deps"] = info
-        log("deps", job=self.id, **info)
 
     def _prune(self, nm_cache):
         try:
@@ -660,6 +682,7 @@ def detect_caps(run=subprocess.run, which=shutil.which):
     except Exception:
         pass
     caps["sqlite3"] = which("sqlite3") is not None
+    caps["subpkg_install"] = True       # deps phase honours spec.extra_pkg_dirs (npm ci in sub-packages with their own lock)
     return caps
 
 
