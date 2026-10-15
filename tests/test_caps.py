@@ -127,6 +127,13 @@ class TestImageRecipe(unittest.TestCase):
         if "fastapi" in names:
             self.assertIn("python-multipart", names)
 
+    def test_reportlab_and_pillow_are_baked_and_smoke_tested(self):
+        # cpu-lane log: stages importing reportlab fell back to the Mac (not in the runner's py_modules)
+        lines = [l.strip() for l in self.read("requirements-runner.txt").splitlines() if l.strip() and not l.startswith("#")]
+        names = {l.split("==")[0].lower() for l in lines}
+        self.assertTrue({"reportlab", "pillow"} <= names, names)
+        self.assertRegex(self.read("Dockerfile"), r"import [^;\n]*reportlab[^;\n]*PIL")
+
     def test_dockerignore_keeps_the_requirements_file(self):
         self.assertNotIn("requirements-runner.txt", self.read(".dockerignore"))
 
