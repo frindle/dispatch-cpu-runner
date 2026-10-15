@@ -27,7 +27,7 @@ RUN set -eux; \
     mkdir -p /opt/python; tar -xzf /tmp/py.tgz -C /opt/python --strip-components=1 --no-same-owner; rm /tmp/py.tgz; \
     /opt/python/bin/python3 -m venv /opt/venv; \
     /opt/venv/bin/pip install --no-cache-dir --disable-pip-version-check --only-binary=:all: -r /tmp/requirements-runner.txt; \
-    /opt/venv/bin/python3 -c "import sqlite3, ssl, flask, requests, paramiko, fastapi, pydantic, starlette, httpx, uvicorn, pytest, yaml; print('job python ok')"; \
+    /opt/venv/bin/python3 -c "import sqlite3, ssl, flask, requests, paramiko, fastapi, pydantic, starlette, httpx, uvicorn, pytest, yaml, reportlab, PIL; print('job python ok')"; \
     rm -f /tmp/requirements-runner.txt
 ENV PATH=/opt/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # Unprivileged identity every job (and every dependency install) runs as.
