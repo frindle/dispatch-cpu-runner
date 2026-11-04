@@ -8,11 +8,14 @@ for python jobs. The agent itself runs on Debian's python.
 
 ### Capabilities (what the queue may ship here)
 On its first claim and every 60 s the agent sends `caps` in the claim body: `{v, agent, arch, node, node_full, python,
-python_full, py_modules[], sqlite3}` (probed with the same `node`/`python3` a job gets). The queue keeps the latest report
+python_full, py_modules[], sqlite3, subpkg_install, setup_phase, llm_relay, artifacts, log_stream, pythons[], uv}` (probed
+with the same `node`/`python3` a job gets; `pythons` lists the extra interpreters for project venvs, `llm_relay` is false
+when the relay selftest failed at startup, see "Remote lane jobs"). The queue keeps the latest report
 per runner and serves it on `GET /api/cpu/runners`; it treats caps older than about 3 minutes as absent, so an older image
 that stops reporting cannot inherit them. The queue compares a stage's needs (node >= 23 for `mock.module`, the python
 minor, third-party imports vs `py_modules`, sqlite3) with these instead of hard-coding the image. Jobs have no network and
-`PIP_NO_INDEX=1`: add a python package by editing `requirements-runner.txt` and updating the container.
+`PIP_NO_INDEX=1`: add a python package by editing `requirements-runner.txt` and updating the container, or build a
+per-job venv in `spec.setup` (below).
 
 It is a pull-based worker for a queue **you provide**: it needs a queue API that implements the contract below (a reference
 implementation is in `reference/queue_server.py`) and a shared token that the queue issues to the runner through a one-time
@@ -84,6 +87,8 @@ bound the total; defaults are 5 concurrent jobs sharing 16 CPUs / 40 GiB (about 
   dropped), to create the namespace and drop privileges. `SYS_ADMIN` is broad: the safety rests on the wrapper dropping
   everything before job code runs. If namespace creation fails, add `--security-opt seccomp=unconfined`.
 - The queue API must be LAN-only and enforce the token itself.
+- Model keys never reach the runner: `spec.llm` calls are relayed to the queue host, which adds the key (see "Remote lane
+  jobs"). `spec.setup` runs third-party build code WITH network (as the job user, like the dependency install).
 
 ## Sizing
 Defaults: 5 concurrent jobs (raised from 2 on 2026-10-10; the host is 44 cores / 88 threads / 256 GiB), container limit 16 CPUs / 40 GiB, `NODE_OPTIONS=--max-old-space-size` per job, jobs `nice`d (5).
@@ -138,7 +143,54 @@ unreachable, DNS fails, loopback bind works, uid != 0, CapEff = 0.
 **Verification status**: A CI/dev sandbox container whose seccomp blocks `unshare` could only test the
 fail-closed behaviour and command shape; the real namespace is proven by the `selftest` the container runs at every start.
 Troubleshooting: if it cannot create a namespace, add `--security-opt seccomp=unconfined` to Extra Parameters (compose: `security_opt`).
-The dependency-install phase has network (it must) and runs as the unprivileged user.
+The dependency-install phase has network (it must) and runs as the unprivileged user; so does `spec.setup`.
+
+## Remote lane jobs
+Optional spec fields for longer jobs that need a prepared environment, model calls, files back and live output. Each
+has a cap the queue checks before it sends one (`setup_phase`, `llm_relay`, `artifacts`, `log_stream`). The client
+sets them with `submit_cpu_job(..., setup=, llm=, artifacts=, on_log=, on_progress=, cancel_if=)`.
+
+- **`setup`** `{cmd, timeout_s}` (or just the cmd string): runs after deps and before the run, in the job's cwd, as the
+  job user WITH network. Under the full wrapper it gets its own pid namespace, so nothing it starts survives into the
+  isolated run. Env: the job env without `PIP_NO_INDEX`, plus `UV_CACHE_DIR=/cache/uv` and `UV_PYTHON_DOWNLOADS=never`
+  (use the baked interpreters, e.g. `uv venv --python 3.12 .venv && uv pip install -r requirements.txt`). Output goes to
+  `out/setup.log`. The timeout is clamped to `CPU_RUNNER_SETUP_TIMEOUT_S` (1800). A failure is an `infra_error`
+  `setup failed (rc=N | timed out after Ns): <last 2000 bytes of setup.log>` and the run never starts. Timing: `setup_s`.
+- **`llm`** (`true`, or a dict of limits the queue applies): the job gets `CPU_RUNNER_LLM_URL`, an OpenAI-style base URL
+  (`http://127.0.0.1:41651/v1` inside the netns). Only `POST /v1/chat/completions` and `GET /v1/models` are forwarded;
+  anything else gets a 404 from the relay. Path: job -> `agent.py relay` (in the netns, as the job user) -> unix socket
+  `out/llm.sock` (0600) -> agent -> `GET|POST /api/cpu/jobs/<id>/llm/v1/<models|chat/completions>` with the runner token
+  and `X-Lease-Token` -> the queue host checks the job, its lease and its limits, adds the model key and forwards. The key
+  never reaches the runner and the runner token never reaches the job. Request bodies are capped at 16 MiB; each call
+  may take up to `CPU_RUNNER_LLM_TIMEOUT_S` (1200). Timing: `llm: {calls, errors}`. At startup `relay_selftest` proves
+  the relay inside a real netns; if it fails, the caps say `llm_relay: false` and only llm jobs are affected.
+- **`artifacts`** (`true`): the job gets `CPU_RUNNER_ARTIFACTS`, an empty dir. After the run, the agent packs it with
+  `tar -czf` run as the job user (links are stored, never followed), capped at `CPU_RUNNER_ARTIFACTS_MAX` (256 MiB
+  compressed), and `PUT`s it with `X-Lease-Token`. The result carries `artifacts: {bytes, sha256, http[, warning]}` or
+  `{error}`; an artifacts problem never changes the exit code. The client downloads the tarball and checks size and
+  sha256 (`result.artifacts_path`). Extract it with a safe extractor: it is job output.
+- **`log_stream`** (`true`): every `CPU_RUNNER_LOG_INTERVAL_S` (3 s) the agent posts new output, `setup.log` first and
+  then stdout (stderr is only in the result tail), to `POST jobs/<id>/log`. The queue appends at `off`, so a resent
+  chunk is harmless; it answers 416 `{size}` when it holds fewer bytes than `off` (it lost some, e.g. a restart), and the
+  agent carries on from `size`. Capped at `CPU_RUNNER_LOG_MAX` (32 MiB) with a `[cpu-runner] log truncated` note. The
+  agent stops streaming after 20 failures in a row or on 400/403/404/409/410/413; the job itself carries on.
+- **Progress** (every job): `CPU_RUNNER_PROGRESS` names a file; its first line (printable, at most 200 chars) goes out
+  with every heartbeat and log post as `progress`, with `phase` (`materialize|deps|setup|running|artifacts|done`).
+- **Cancel**: `DELETE jobs/<id>` works in every phase, setup included (the next heartbeat returns `cancel:true`; the job
+  is killed and nothing is posted). The client cancels on `cancel_if()` and when its caller is interrupted.
+
+Job dir (`/work/job-<id>-*`, root 0711): `checkout/ home/ tmp/ tools/ art/` belong to the job user; `out/` (root 0711)
+holds `stdout`, `stderr` and `setup.log` (created by the agent, written through inherited fds), `progress` (job user) and
+`llm.sock`; `dl/` (root 0700) holds the downloaded payload, patch and tools.
+
+Known limits:
+- All jobs share uid 10001, so a concurrent job could reach another job's files and relay socket (for example through
+  `/proc`) and spend its model calls. Per-slot uids would close this.
+- `/tmp`, `/cache/npm` and `/cache/uv` are shared and writable by every job.
+- Setup runs third-party build code with network.
+- A model call in flight when its job ends still finishes upstream; the queue's per-job limits bound this.
+- Without the full wrapper (`unshare --net` only), setup gets no pid namespace: a process that leaves the setup's
+  process group (`setsid`) can outlive it.
 
 ## Queue API contract (reference: `reference/queue_server.py`)
 All under `/api/cpu/`, header `Authorization: Bearer <token>` (compare constant-time; `GET health` and `POST enroll` are
@@ -146,10 +198,14 @@ unauthenticated). These routes must be LAN-only and check the token themselves (
 
 Producer (client):
 - `POST jobs` `{spec,label,stage,bundle_id}` -> 201 `{id}`; status `uploading`.
-  spec: `{cmd, cwd, timeout_s, env{}, payload_kind: bundle|archive, lockfile_hash, stage, network: "none"}`
+  spec: `{cmd, cwd, timeout_s, env{}, payload_kind: bundle|archive, lockfile_hash, stage, network: "none"}`, plus
+  optional `setup`, `llm`, `artifacts`, `log_stream`, `extra_pkg_dirs`, `owner` (see "Remote lane jobs")
 - `PUT jobs/<id>/payload` (bundle or tar), optional `PUT jobs/<id>/patch` (git diff), `PUT jobs/<id>/tools` (tgz)
 - `POST jobs/<id>/ready` -> status `pending` (400 if no payload)
-- `GET jobs/<id>` -> `{status: uploading|pending|running|done|failed_infra|cancelled, attempt, result}`
+- `GET jobs/<id>` -> `{status: uploading|pending|running|done|failed_infra|cancelled, attempt, result, phase, progress,
+  log_size, has_artifacts, llm_calls}`
+- `GET jobs/<id>/log?off=N` -> the streamed log from byte N (raw), header `X-Log-Size`
+- `GET jobs/<id>/artifacts` -> the job's artifacts tarball, or 404
 - `DELETE jobs/<id>` -> cancel (pending -> cancelled; running -> heartbeat returns `cancel:true`)
 
 Enrollment and config (agent, see "Enrollment"):
@@ -160,7 +216,13 @@ Runner (agent):
 - `POST claim` `{runner_id, lease_s, caps?}` (`caps`: capability report, see "Capabilities"; optional, unknown fields are ignored) -> 200 `{job:{id, spec(+has_patch,has_tools), attempt, lease_token}}` or 204.
   Atomic; picks oldest `pending`; sets lease_expires = now + lease_s.
 - `GET jobs/<id>/payload|patch|tools` -> bytes
-- `POST jobs/<id>/heartbeat` `{runner_id, lease_token, lease_s}` -> 200 `{cancel: bool}`; 409 if lease_token no longer holds
+- `POST jobs/<id>/heartbeat` `{runner_id, lease_token, lease_s, phase?, progress?}` -> 200 `{cancel: bool}`; 409 if lease_token no longer holds
+- `POST jobs/<id>/log` `{runner_id, lease_token, off, data_b64, phase, progress}` -> 200 `{size}`; 409 (lease); 400 (bad
+  chunk); 416 `{error: "gap", size}` when `off` is past what the queue holds. Append `data[size-off:]`.
+- `PUT jobs/<id>/artifacts` (body: the tarball, header `X-Lease-Token`) -> 200; 409 if the lease no longer holds
+- `GET jobs/<id>/llm/v1/models`, `POST jobs/<id>/llm/v1/chat/completions` (header `X-Lease-Token`): 404 unknown job, 409
+  lease, 403 the spec has no `llm`, 405 other method, 503 no upstream configured, else the upstream's status and body
+  (502 if it is unreachable). The queue adds the model key and enforces its limits here.
 - `POST jobs/<id>/result` `{runner_id, lease_token, exit_code, timed_out, stdout_tail, stderr_tail, timings, infra_error?}` -> 200 / 409
 - `POST jobs/<id>/release` `{runner_id, lease_token}` -> job back to `pending`
 - Server-side reaper (on every request or timer): `running` with lease_expires < now -> `pending` (attempt kept; at 3 -> `failed_infra`).
@@ -176,17 +238,20 @@ runner reports `infra_error`. `fallback=False` raises instead. Config: `CPU_RUNN
 (default `~/.config/dispatch-cpu-runner/token`, a file you create).
 (ship helper scripts via `tools`). Caveat: the command must be self-contained inside the checkout (+ `$JOB_TOOLS`); the runner has no network for the command itself.
 
-## Tests
-`python3 -W ignore -m unittest discover -s tests -v` (needs git, python3; no Docker). Covers: bundle + dirty +
-untracked + ignored-excluded shipping and unchanged real index, archive mode/cwd, env allowlist and token
-non-leak, dep cache miss/hit/lockfile change, timeout kills process group, exit codes/tails, lease expiry
-requeue after hard runner kill (attempt 2), lease-lost kills job without posting, local fallback (unreachable,
-unconfigured, unclaimed -> cancel, bad token), isolation fail-closed.
+Remote lane jobs add `setup=`, `llm=`, `artifacts=` (+ `artifacts_dest=`), `log_stream=` / `on_log=`, `on_progress=`,
+`cancel_if=` and `unreachable_grace_s=` (60). `setup`, `llm` and `artifacts` need `fallback=False`: a local run could
+not honour them. CLI: `python3 cpu_job.py WORKTREE CMD [--setup CMD] [--llm] [--artifacts DEST] [--follow]
+[--no-fallback]`; SIGTERM cancels the job.
 
 ## Tests
-`python3 -W ignore -m unittest discover -s tests -v` (needs git and python3; no Docker). Covers bundle, dirty and untracked
-file shipping, env allowlist and token non-leak, dep cache miss/hit, timeouts, lease expiry requeue, lease-lost handling,
-local fallback, isolation fail-closed, enrollment (single use, 0600 storage, rotation, remote config) and self-reload.
+`python3 -W ignore -m unittest discover -s tests -v` (needs git and python3 on Linux; no Docker). Covers bundle, dirty and
+untracked file shipping with the real index unchanged, archive mode and cwd, env allowlist and token non-leak, dep cache
+miss/hit, timeouts, lease expiry requeue, lease-lost handling, local fallback, isolation fail-closed, enrollment (single
+use, 0600 storage, rotation, remote config), self-reload, caps, and the remote lane features (`tests/test_remote.py`):
+setup env, failure, timeout clamp and cancel; the LLM relay on both paths (in-agent bridge, and the `relay` subcommand
+with its ready handshake, with `env` standing in for `unshare`), key and token non-leak, only the two routes forwarded;
+artifacts round trip, cap and corrupt download; log streaming, cap and 416 resync; heartbeat progress; job dir modes; and
+the queue-side contract of the new routes. The namespace itself is proven by the container's startup selftests.
 CI runs these and publishes the image on every push to `main` and on `v*` tags.
 
 ## License

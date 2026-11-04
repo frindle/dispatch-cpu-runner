@@ -6,7 +6,7 @@ tests run the agent and client against it. State is in-memory; the real queue
 would persist rows in ollama-queue-state.json under its flock.
 Auth: `Authorization: Bearer <token>` on every request except GET /api/cpu/health.
 """
-import json, re, secrets, threading, time, uuid
+import base64, json, re, secrets, threading, time, urllib.error, urllib.parse, urllib.request, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 MAX_ATTEMPTS = 3
@@ -22,6 +22,10 @@ class Store:
         self.codes = set()          # live single-use enrollment codes
         self.config = {"concurrency": 2, "lease_s": 60}
         self.enrolled = []
+        # spec.llm: where /api/cpu/jobs/<id>/llm/v1/... is forwarded (an OpenAI-style base URL ending in /v1) and the
+        # key added on the way. Only the queue side ever holds the key.
+        self.llm_upstream = None
+        self.llm_key = None
 
     def reap(self):
         """Lease expiry: running jobs whose lease lapsed go back to pending (or failed_infra)."""
@@ -44,13 +48,48 @@ class H(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
-    def _send(self, code, body=None, raw=None):
+    def _send(self, code, body=None, raw=None, ctype=None, headers=None):
         data = raw if raw is not None else (json.dumps(body).encode() if body is not None else b"")
         self.send_response(code)
-        self.send_header("Content-Type", "application/octet-stream" if raw is not None else "application/json")
+        self.send_header("Content-Type", ctype or ("application/octet-stream" if raw is not None else "application/json"))
         self.send_header("Content-Length", str(len(data)))
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
         self.end_headers()
         self.wfile.write(data)
+
+    def _llm(self, jid, sub, method):
+        """spec.llm relay target: check the job and its lease, then forward to the upstream with the key."""
+        S = self.store
+        body = self._body() if method == "POST" else None
+        with S.lock:
+            S.reap()
+            j = S.jobs.get(jid)
+            if j is None:
+                return self._send(404, {"error": "not found"})
+            if j["status"] != "running" or not j["lease_token"] or \
+                    self.headers.get("X-Lease-Token") != j["lease_token"]:
+                return self._send(409, {"error": "lease lost"})
+            if not j["spec"].get("llm"):
+                return self._send(403, {"error": "job did not ask for llm"})
+            if (method, sub) not in (("POST", "chat/completions"), ("GET", "models")):
+                return self._send(405, {"error": "method not allowed"})
+            j["llm_calls"] = j.get("llm_calls", 0) + 1
+            upstream, key = S.llm_upstream, S.llm_key
+        if not upstream:
+            return self._send(503, {"error": "no llm upstream configured"})
+        req = urllib.request.Request(upstream.rstrip("/") + "/" + sub, data=body, method=method)
+        if key:
+            req.add_header("Authorization", "Bearer " + key)
+        if body is not None:
+            req.add_header("Content-Type", "application/json")
+        try:
+            with urllib.request.urlopen(req, timeout=600) as r:
+                return self._send(r.status, raw=r.read(), ctype=r.headers.get("Content-Type") or "application/json")
+        except urllib.error.HTTPError as e:
+            return self._send(e.code, raw=e.read(), ctype=e.headers.get("Content-Type") or "application/json")
+        except Exception as e:
+            return self._send(502, {"error": "upstream unreachable: %s" % type(e).__name__})
 
     def _body(self):
         n = int(self.headers.get("Content-Length") or 0)
@@ -77,6 +116,9 @@ class H(BaseHTTPRequestHandler):
             return self._send(200, {"token": S.token, "runner_id": b.get("runner_id"), "config": S.config})
         if self.headers.get("Authorization") != "Bearer " + S.token:
             return self._send(401, {"error": "unauthorized"})
+        m = re.match(r"^/api/cpu/jobs/([0-9a-f]+)/llm/v1/(chat/completions|models)$", path)
+        if m:
+            return self._llm(m.group(1), m.group(2), method)
         with S.lock:
             S.reap()
             if method == "POST" and path == "/api/cpu/jobs":
@@ -116,7 +158,43 @@ class H(BaseHTTPRequestHandler):
             j, sub = S.jobs[m.group(1)], m.group(2)
             if sub is None and method == "GET":
                 return self._send(200, {"id": j["id"], "status": j["status"], "attempt": j["attempt"],
-                                        "result": j["result"], "runner_id": j["runner_id"]})
+                                        "result": j["result"], "runner_id": j["runner_id"],
+                                        "phase": j.get("phase"), "progress": j.get("progress"),
+                                        "log_size": len(j.get("log") or b""), "has_artifacts": "artifacts" in j,
+                                        "llm_calls": j.get("llm_calls", 0)})
+            if sub == "log" and method == "GET":
+                q = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+                try:
+                    off = max(0, int((q.get("off") or ["0"])[0]))
+                except ValueError:
+                    return self._send(400, {"error": "bad off"})
+                log = bytes(j.get("log") or b"")
+                return self._send(200, raw=log[off:], headers={"X-Log-Size": str(len(log))})
+            if sub == "log" and method == "POST":
+                b = self._json()
+                if j["status"] != "running" or j["lease_token"] != b.get("lease_token"):
+                    return self._send(409, {"error": "lease lost"})
+                log = j.setdefault("log", bytearray())
+                try:
+                    off, data = int(b.get("off")), base64.b64decode(b.get("data_b64") or "")
+                except (TypeError, ValueError):
+                    return self._send(400, {"error": "bad log chunk"})
+                if off > len(log):
+                    return self._send(416, {"error": "gap", "size": len(log)})
+                log += data[len(log) - off:]          # an overlap (a resent chunk) appends only what is new
+                for k in ("phase", "progress"):
+                    if isinstance(b.get(k), str):
+                        j[k] = b[k][:200]
+                return self._send(200, {"ok": True, "size": len(log)})
+            if sub == "artifacts":
+                if method == "PUT":
+                    if j["status"] != "running" or j["lease_token"] != self.headers.get("X-Lease-Token"):
+                        return self._send(409, {"error": "lease lost"})
+                    j["artifacts"] = self._body()
+                    return self._send(200, {"ok": True, "bytes": len(j["artifacts"])})
+                if method == "GET" and "artifacts" in j:
+                    return self._send(200, raw=j["artifacts"])
+                return self._send(404, {"error": "no artifacts"})
             if sub is None and method == "DELETE":
                 j["cancel"] = True
                 if j["status"] in ("pending", "uploading"):
@@ -141,6 +219,9 @@ class H(BaseHTTPRequestHandler):
                     return self._send(409, {"error": "lease lost"})
                 if sub == "heartbeat":
                     j["lease_expires"] = S.clock() + int(b.get("lease_s") or 60)
+                    for k in ("phase", "progress"):
+                        if isinstance(b.get(k), str):
+                            j[k] = b[k][:200]
                     return self._send(200, {"ok": True, "cancel": j["cancel"]})
                 if sub == "release":
                     j["status"], j["lease_token"], j["runner_id"] = "pending", None, None

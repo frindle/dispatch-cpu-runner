@@ -58,4 +58,5 @@ jobs:
           img=ghcr.io/frindle/dispatch-cpu-runner@${{ steps.build.outputs.digest }}
           docker run --rm --entrypoint python3 "$img" -c "import sys,sqlite3,ssl,flask,requests,paramiko,fastapi,pydantic,starlette,httpx,uvicorn,pytest,yaml; assert sys.version_info[:2]==(3,14), sys.version; print('job python', sys.version.split()[0])"
           docker run --rm --entrypoint node "$img" -v
-          docker run --rm --entrypoint /usr/bin/python3 "$img" -c "import runpy,json; m=runpy.run_path('/opt/runner/agent.py'); c=m['detect_caps'](); print(json.dumps(c)); assert c['python']=='3.14' and c['node']==26 and c['sqlite3'] and 'flask' in c['py_modules'], c"
+          docker run --rm --entrypoint /usr/bin/python3 "$img" -c "import runpy,json; m=runpy.run_path('/opt/runner/agent.py'); c=m['detect_caps'](); print(json.dumps(c)); assert c['python']=='3.14' and c['node']==26 and c['sqlite3'] and 'flask' in c['py_modules'], c; assert c['pythons']==['3.12','3.13','3.14'] and c.get('uv') and c['llm_relay'] and c['setup_phase'] and c['artifacts'] and c['log_stream'], c"
+          docker run --rm --entrypoint sh "$img" -c 'set -e; for v in 3.12 3.13; do d=$(mktemp -d); UV_PYTHON_DOWNLOADS=never uv venv -q --python "$v" "$d/v"; "$d/v/bin/python" -c "import sys; print(sys.version.split()[0])"; done; test "$(stat -c "%U %a" /work)" = "root 711"'
