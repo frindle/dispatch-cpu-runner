@@ -5,11 +5,19 @@ This is the contract the real queue (ollama-queue-api.py) must implement; the
 tests run the agent and client against it. State is in-memory; the real queue
 would persist rows in ollama-queue-state.json under its flock.
 Auth: `Authorization: Bearer <token>` on every request except GET /api/cpu/health.
+
+Model hold: while the queue host's models are unavailable (`Store.model_hold`, the real queue's Darkbloom Sandbox
+hold), spec.llm jobs stay pending (other jobs are still claimed), their view says why, and a relay call from a job
+already running gets 503 `sandbox_hold` with Retry-After. The real queue first waits for the hold to lift.
 """
 import base64, json, re, secrets, threading, time, urllib.error, urllib.parse, urllib.request, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 MAX_ATTEMPTS = 3
+RUNNER_FRESH_S = 180        # a runner that has not polled for this long is not online
+HOLD_WAITING = "darkbloom sandbox hold: model jobs wait until it is released"
+HOLD_ERROR = "darkbloom sandbox hold: the queue host's models are unloaded until the hold is released"
+PER_ATTEMPT = ("log", "phase", "progress", "artifacts", "llm_calls", "llm_errors", "llm_held")
 
 
 class Store:
@@ -26,6 +34,15 @@ class Store:
         # key added on the way. Only the queue side ever holds the key.
         self.llm_upstream = None
         self.llm_key = None
+        self.model_hold = False     # True: the models are unavailable; spec.llm jobs wait (see the module doc)
+
+    def waiting(self, j):
+        """Why a pending job is not being claimed (None: a runner is online, it is just queued)."""
+        if j["spec"].get("llm") and self.model_hold:
+            return HOLD_WAITING
+        if not any(t >= self.clock() - RUNNER_FRESH_S for t in self.runner_seen.values()):
+            return "no runner online"
+        return None
 
     def reap(self):
         """Lease expiry: running jobs whose lease lapsed go back to pending (or failed_infra)."""
@@ -75,9 +92,18 @@ class H(BaseHTTPRequestHandler):
             if (method, sub) not in (("POST", "chat/completions"), ("GET", "models")):
                 return self._send(405, {"error": "method not allowed"})
             j["llm_calls"] = j.get("llm_calls", 0) + 1
+            if S.model_hold:
+                j["llm_held"] = j.get("llm_held", 0) + 1
+                return self._send(503, {"error": {"message": HOLD_ERROR, "type": "sandbox_hold", "code": "sandbox_hold"}},
+                                  headers={"Retry-After": "30"})
             upstream, key = S.llm_upstream, S.llm_key
+
+        def failed(code, **kw):     # an answer the job's call did not get through on: counted as an llm error
+            with S.lock:
+                j["llm_errors"] = j.get("llm_errors", 0) + 1
+            return self._send(code, **kw)
         if not upstream:
-            return self._send(503, {"error": "no llm upstream configured"})
+            return failed(503, body={"error": "no llm upstream configured"})
         req = urllib.request.Request(upstream.rstrip("/") + "/" + sub, data=body, method=method)
         if key:
             req.add_header("Authorization", "Bearer " + key)
@@ -87,9 +113,9 @@ class H(BaseHTTPRequestHandler):
             with urllib.request.urlopen(req, timeout=600) as r:
                 return self._send(r.status, raw=r.read(), ctype=r.headers.get("Content-Type") or "application/json")
         except urllib.error.HTTPError as e:
-            return self._send(e.code, raw=e.read(), ctype=e.headers.get("Content-Type") or "application/json")
+            return failed(e.code, raw=e.read(), ctype=e.headers.get("Content-Type") or "application/json")
         except Exception as e:
-            return self._send(502, {"error": "upstream unreachable: %s" % type(e).__name__})
+            return failed(502, body={"error": "upstream unreachable: %s" % type(e).__name__})
 
     def _body(self):
         n = int(self.headers.get("Content-Length") or 0)
@@ -137,7 +163,9 @@ class H(BaseHTTPRequestHandler):
                     S.runner_caps[b.get("runner_id")] = b["caps"]
                 for jid in S.order:
                     j = S.jobs[jid]
-                    if j["status"] == "pending" and not j["cancel"]:
+                    if j["status"] == "pending" and not j["cancel"] and not (j["spec"].get("llm") and S.model_hold):
+                        for k in PER_ATTEMPT:       # each attempt starts clean: an earlier one's output is not its
+                            j.pop(k, None)
                         j["status"] = "running"
                         j["attempt"] += 1
                         j["runner_id"] = b["runner_id"]
@@ -157,11 +185,15 @@ class H(BaseHTTPRequestHandler):
                 return self._send(404, {"error": "not found"})
             j, sub = S.jobs[m.group(1)], m.group(2)
             if sub is None and method == "GET":
+                live = j["status"] in ("pending", "running")
                 return self._send(200, {"id": j["id"], "status": j["status"], "attempt": j["attempt"],
                                         "result": j["result"], "runner_id": j["runner_id"],
                                         "phase": j.get("phase"), "progress": j.get("progress"),
                                         "log_size": len(j.get("log") or b""), "has_artifacts": "artifacts" in j,
-                                        "llm_calls": j.get("llm_calls", 0)})
+                                        "llm_calls": j.get("llm_calls", 0), "llm_errors": j.get("llm_errors", 0),
+                                        "llm_held": j.get("llm_held", 0),
+                                        "model_hold": bool(j["spec"].get("llm")) and live and S.model_hold,
+                                        "waiting": S.waiting(j) if j["status"] == "pending" else None})
             if sub == "log" and method == "GET":
                 q = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
                 try:

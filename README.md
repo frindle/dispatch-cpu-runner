@@ -164,6 +164,10 @@ sets them with `submit_cpu_job(..., setup=, llm=, artifacts=, on_log=, on_progre
   never reaches the runner and the runner token never reaches the job. Request bodies are capped at 16 MiB; each call
   may take up to `CPU_RUNNER_LLM_TIMEOUT_S` (1200). Timing: `llm: {calls, errors}`. At startup `relay_selftest` proves
   the relay inside a real netns; if it fails, the caps say `llm_relay: false` and only llm jobs are affected.
+  While the queue host's models are held (a Darkbloom Sandbox hold unloads them), the queue keeps llm jobs pending
+  (others are still claimed) and says why in the job's `waiting`; a call from a job already running waits for the hold
+  to lift and, if it does not in time, gets 503 `sandbox_hold` with `Retry-After`. The client leaves that wait out of
+  `claim_timeout_s` and reports it in `result.llm` (`{calls, errors, held, hold_wait_s}`, from the queue's counts).
 - **`artifacts`** (`true`): the job gets `CPU_RUNNER_ARTIFACTS`, an empty dir. After the run, the agent packs it with
   `tar -czf` run as the job user (links are stored, never followed), capped at `CPU_RUNNER_ARTIFACTS_MAX` (256 MiB
   compressed), and `PUT`s it with `X-Lease-Token`. The result carries `artifacts: {bytes, sha256, http[, warning]}` or
@@ -203,7 +207,10 @@ Producer (client):
 - `PUT jobs/<id>/payload` (bundle or tar), optional `PUT jobs/<id>/patch` (git diff), `PUT jobs/<id>/tools` (tgz)
 - `POST jobs/<id>/ready` -> status `pending` (400 if no payload)
 - `GET jobs/<id>` -> `{status: uploading|pending|running|done|failed_infra|cancelled, attempt, result, phase, progress,
-  log_size, has_artifacts, llm_calls}`
+  log_size, has_artifacts, llm_calls, llm_errors, llm_held, model_hold, waiting}`. `phase` through the llm counts
+  belong to the current attempt. `model_hold`: a spec.llm job that is pending or running while the models are held.
+  `waiting` (pending only, else null): why no runner has it, e.g. `no runner online`, `no runner reports <caps>` or the
+  model hold; null when a runner that fits is online and the job is just queued.
 - `GET jobs/<id>/log?off=N` -> the streamed log from byte N (raw), header `X-Log-Size`
 - `GET jobs/<id>/artifacts` -> the job's artifacts tarball, or 404
 - `DELETE jobs/<id>` -> cancel (pending -> cancelled; running -> heartbeat returns `cancel:true`)
@@ -214,14 +221,17 @@ Enrollment and config (agent, see "Enrollment"):
 
 Runner (agent):
 - `POST claim` `{runner_id, lease_s, caps?}` (`caps`: capability report, see "Capabilities"; optional, unknown fields are ignored) -> 200 `{job:{id, spec(+has_patch,has_tools), attempt, lease_token}}` or 204.
-  Atomic; picks oldest `pending`; sets lease_expires = now + lease_s.
+  Atomic; picks the oldest `pending` job this runner can take (not a spec.llm job while the models are held; the real
+  queue also matches the spec's remote lane features to the runner's caps); sets lease_expires = now + lease_s and
+  starts the attempt clean (no log, phase, progress, artifacts or llm counts from an earlier one).
 - `GET jobs/<id>/payload|patch|tools` -> bytes
 - `POST jobs/<id>/heartbeat` `{runner_id, lease_token, lease_s, phase?, progress?}` -> 200 `{cancel: bool}`; 409 if lease_token no longer holds
 - `POST jobs/<id>/log` `{runner_id, lease_token, off, data_b64, phase, progress}` -> 200 `{size}`; 409 (lease); 400 (bad
   chunk); 416 `{error: "gap", size}` when `off` is past what the queue holds. Append `data[size-off:]`.
 - `PUT jobs/<id>/artifacts` (body: the tarball, header `X-Lease-Token`) -> 200; 409 if the lease no longer holds
 - `GET jobs/<id>/llm/v1/models`, `POST jobs/<id>/llm/v1/chat/completions` (header `X-Lease-Token`): 404 unknown job, 409
-  lease, 403 the spec has no `llm`, 405 other method, 503 no upstream configured, else the upstream's status and body
+  lease, 403 the spec has no `llm`, 405 other method, 503 no upstream configured, 503 `sandbox_hold` + `Retry-After`
+  while the models are held (counted in `llm_held`), else the upstream's status and body
   (502 if it is unreachable). The queue adds the model key and enforces its limits here.
 - `POST jobs/<id>/result` `{runner_id, lease_token, exit_code, timed_out, stdout_tail, stderr_tail, timings, infra_error?}` -> 200 / 409
 - `POST jobs/<id>/release` `{runner_id, lease_token}` -> job back to `pending`
@@ -237,10 +247,16 @@ unreachable/unauthorised, no runner claims within `claim_timeout_s` (180), the j
 runner reports `infra_error`. `fallback=False` raises instead. Config: `CPU_RUNNER_API`, `CPU_RUNNER_TOKEN_FILE`
 (default `~/.config/dispatch-cpu-runner/token`, a file you create).
 (ship helper scripts via `tools`). Caveat: the command must be self-contained inside the checkout (+ `$JOB_TOOLS`); the runner has no network for the command itself.
+`claim_timeout_s` counts only time spent pending, not a spec.llm job's wait behind a model hold, and a job put back in
+the queue (its runner died or released it) gets a fresh window, as each new attempt gets a fresh `max_wait_s`
+(default `timeout_s` + the setup timeout + 600). The fallback message carries the queue's reason (`no runner claimed
+within 180s (no runner online)`).
 
 Remote lane jobs add `setup=`, `llm=`, `artifacts=` (+ `artifacts_dest=`), `log_stream=` / `on_log=`, `on_progress=`,
 `cancel_if=` and `unreachable_grace_s=` (60). `setup`, `llm` and `artifacts` need `fallback=False`: a local run could
-not honour them. CLI: `python3 cpu_job.py WORKTREE CMD [--setup CMD] [--llm] [--artifacts DEST] [--follow]
+not honour them. While the job is queued, `on_progress` gets `("waiting", why)`; when a runner re-runs it, `on_log` gets
+a `[cpu_job] the job restarted (attempt N)` line and then the new attempt's output. `llm=` jobs return `result.llm`.
+CLI: `python3 cpu_job.py WORKTREE CMD [--setup CMD] [--llm] [--artifacts DEST] [--follow]
 [--no-fallback]`; SIGTERM cancels the job.
 
 ## Tests
@@ -250,8 +266,10 @@ miss/hit, timeouts, lease expiry requeue, lease-lost handling, local fallback, i
 use, 0600 storage, rotation, remote config), self-reload, caps, and the remote lane features (`tests/test_remote.py`):
 setup env, failure, timeout clamp and cancel; the LLM relay on both paths (in-agent bridge, and the `relay` subcommand
 with its ready handshake, with `env` standing in for `unshare`), key and token non-leak, only the two routes forwarded;
-artifacts round trip, cap and corrupt download; log streaming, cap and 416 resync; heartbeat progress; job dir modes; and
-the queue-side contract of the new routes. The namespace itself is proven by the container's startup selftests.
+artifacts round trip, cap and corrupt download; log streaming, cap and 416 resync; heartbeat progress; job dir modes; the
+client's queue wait (claim clock and the queue's reason, the model hold, a job handed back and re-run with a fresh log,
+an older queue's job view); and the queue-side contract of the new routes, the model hold and per-attempt state. The
+namespace itself is proven by the container's startup selftests.
 CI runs these and publishes the image on every push to `main` and on `v*` tags.
 
 ## License

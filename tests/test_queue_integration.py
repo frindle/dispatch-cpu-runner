@@ -12,11 +12,25 @@ sys.path[:0] = [os.path.join(ROOT, "client"), os.path.join(ROOT, "tests"), BIN]
 TOKEN = "integration-token"
 
 
+def _restore_env(saved):
+    for k, v in saved.items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
+
+
 @unittest.skipUnless(HAVE, "queue-side modules not in ~/bin")
 class QueueIntegration(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.td = tempfile.mkdtemp(prefix="cpulane-int-")
+        # class cleanups also run when setUpClass fails: the env this class sets (above all CPU_RUNNER_TOKEN_FILE, which
+        # an agent prefers to CPU_RUNNER_TOKEN) must never reach the agents of the test modules that run after it
+        saved = {k: os.environ.get(k) for k in ("CPU_LANE_DIR", "CPU_RUNNER_TOKEN_FILE", "DISPATCH_VERIFY_SANDBOX",
+                                                "OLLAMA_QUEUE_NO_NOTIFY", "CPU_RUNNER_API")}
+        cls.addClassCleanup(_restore_env, saved)
+        cls.addClassCleanup(subprocess.run, ["rm", "-rf", cls.td])
         cls.tok = os.path.join(cls.td, "token")
         open(cls.tok, "w").write(TOKEN + "\n")
         os.environ.update(CPU_LANE_DIR=os.path.join(cls.td, "jobs"), CPU_RUNNER_TOKEN_FILE=cls.tok,
@@ -42,7 +56,6 @@ class QueueIntegration(unittest.TestCase):
             if p.poll() is None:
                 p.kill(); p.wait()
         cls.srv.shutdown()
-        subprocess.run(["rm", "-rf", cls.td])
 
     def setUp(self):
         for p in self.procs:                      # one test's runner must not serve the next

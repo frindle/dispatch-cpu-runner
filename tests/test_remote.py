@@ -1,11 +1,12 @@
 """Remote lane job features end to end: agent + client + reference queue on one machine (no Docker).
 spec.setup, spec.llm (both relay paths), spec.artifacts, spec.log_stream, heartbeat phase/progress, job dir modes,
-caller-side cancel, the queue-side contract of the new routes, and the feature caps.
+caller-side cancel, the client's queue wait (claim clock, reasons, the model hold, a job handed back and re-run, an older
+queue's job view), the queue-side contract of the new routes and the model hold, and the feature caps.
 The network namespace itself needs CAP_SYS_ADMIN and is proven by `agent.py selftest` inside the container; here the
 in-netns relay path runs with `env` standing in for `unshare` (same wrapper, relay and ready-file handshake).
 Run: python3 -W ignore -m unittest discover -s tests -v
 """
-import hashlib, json, os, socket, subprocess, sys, tarfile, tempfile, threading, time, unittest
+import hashlib, json, os, re, socket, subprocess, sys, tarfile, tempfile, threading, time, unittest
 import urllib.error, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest import mock
@@ -15,6 +16,7 @@ from test_e2e import Base, ROOT, TOKEN, sh  # noqa: E402
 from test_caps import FakeRun  # noqa: E402
 import agent as agent_mod  # noqa: E402
 import cpu_job  # noqa: E402
+import queue_server  # noqa: E402
 
 AGENT = os.path.join(ROOT, "agent", "agent.py")
 KEY = "sk-upstream-secret-123"
@@ -162,7 +164,14 @@ class RemoteBase(Base):
         self.assertEqual({a for _, _, a, _ in up.seen}, {"Bearer " + KEY})
         self.assertEqual(json.loads(up.seen[1][3])["messages"][0]["content"], "hi")
         self.assertEqual(r.timings.get("llm"), {"calls": 3, "errors": 1})
-        self.assertEqual(self.job()["llm_calls"], 3)
+        self.assertEqual((self.job()["llm_calls"], self.job().get("llm_errors")), (3, 1))   # the 429 is an error
+        self.assertEqual({k: r.llm[k] for k in ("calls", "errors", "held")}, {"calls": 3, "errors": 1, "held": 0})
+
+    def pending_and_polled(self):
+        """The newest job is pending while a runner is polling the queue."""
+        with self.store.lock:
+            js = list(self.store.jobs.values())
+            return bool(js and js[-1]["status"] == "pending" and self.store.runner_seen)
 
 
 class TestSetupPhase(RemoteBase):
@@ -453,6 +462,81 @@ class TestJobDir(RemoteBase):
             self.assertIn(line, r.stdout_tail)
 
 
+class TestQueueWait(RemoteBase):
+    """What the client does while its job is not running: the claim clock, the queue's reason, the model hold, and a
+    job its runner hands back."""
+
+    def test_claim_timeout_names_the_queue_reason(self):
+        progress = []
+        with self.assertRaises(RuntimeError) as cm:          # no runner at all
+            self.submit("true", claim_timeout_s=1, on_progress=lambda ph, pr: progress.append((ph, pr)))
+        self.assertIn("no runner claimed within 1s (no runner online)", str(cm.exception))
+        self.assertIn(("waiting", "no runner online"), progress)
+        self.assertEqual(self.job()["status"], "cancelled")
+
+    def test_model_hold_wait_is_not_claim_time_and_is_reported(self):
+        up = self.upstream()
+        self.store.model_hold = True
+        self.start_agent()
+        progress, res = [], {}
+        t = threading.Thread(target=lambda: res.update(r=self.submit(
+            "python3 llm_client.py", llm=True, claim_timeout_s=2, on_progress=lambda ph, pr: progress.append((ph, pr)))))
+        t.start()
+        self.assertTrue(wait_for(self.pending_and_polled, 30), "the job never reached the queue")
+        time.sleep(3.5)                                    # the runner polls all along; claim_timeout_s is long gone
+        self.assertEqual(self.job()["status"], "pending")
+        self.assertIn(("waiting", queue_server.HOLD_WAITING), progress)
+        self.store.model_hold = False
+        t.join(60)
+        r = res["r"]
+        self.assert_llm_run(r, up)
+        self.assertGreaterEqual(r.llm["hold_wait_s"], 3)
+        self.assertEqual(self.job()["attempt"], 1)
+
+    def test_a_job_handed_back_gets_a_fresh_claim_window_and_its_rerun_a_fresh_log(self):
+        """Its runner is stopped mid-run (later than claim_timeout_s after submit): the agent kills the job and hands it
+        back, it waits in the queue, and another runner runs it again from the start."""
+        once = os.path.join(self.td, "once")
+        a = self.start_agent(CPU_RUNNER_LOG_INTERVAL_S="0.2")
+        chunks, res = [], {}
+        t0 = time.time()
+        cmd = "if [ -e %s ]; then echo second-run; else touch %s; echo first-run; sleep 30; fi" % (once, once)
+        t = threading.Thread(target=lambda: res.update(r=self.submit(cmd, claim_timeout_s=5, on_log=chunks.append)))
+        t.start()
+        self.assertTrue(wait_for(lambda: b"first-run" in b"".join(chunks), 30), "the first run never streamed")
+        time.sleep(max(0.0, 6 - (time.time() - t0)))
+        a.terminate()                                      # graceful stop: kill the job, release it
+        self.assertEqual(a.wait(30), 0)
+        self.assertTrue(wait_for(lambda: self.job()["status"] == "pending", 10), self.job()["status"])
+        time.sleep(1)                                      # the client sees it queued again
+        self.assertTrue(t.is_alive(), res)
+        self.start_agent(CPU_RUNNER_LOG_INTERVAL_S="0.2")
+        t.join(60)
+        r = res["r"]
+        self.assertEqual((r.ran_on, r.exit_code), ("runner", 0), r.infra_error)
+        self.assertEqual(r.stdout_tail.strip(), "second-run")
+        self.assertEqual(b"".join(chunks), b"first-run\n\n[cpu_job] the job restarted (attempt 2): its output starts "
+                                           b"again\nsecond-run\n")
+        self.assertEqual(self.job()["attempt"], 2)
+
+    def test_an_older_queue_view_still_works(self):
+        """A queue from before the remote lane state answers GET jobs/<id> with id, status, attempt, result, runner_id."""
+        self.start_agent()
+        real = cpu_job._http
+
+        def old(api, tok, method, path, body=None, raw=None, timeout=30):
+            code, st = real(api, tok, method, path, body, raw, timeout)
+            if method == "GET" and re.match(r"^/api/cpu/jobs/[0-9a-f]+$", path) and isinstance(st, dict):
+                st = {k: st[k] for k in ("id", "status", "attempt", "result", "runner_id")}
+            return code, st
+        progress, chunks = [], []
+        with mock.patch.object(cpu_job, "_http", old):
+            r = self.submit("echo hi", llm=True, on_log=chunks.append, on_progress=lambda *a: progress.append(a))
+        self.assertEqual((r.ran_on, r.exit_code, r.stdout_tail), ("runner", 0, "hi\n"), r.infra_error)
+        self.assertEqual(r.llm, {"calls": 0, "errors": 0, "held": 0, "hold_wait_s": 0.0})
+        self.assertEqual((progress, chunks), ([], []))
+
+
 class TestQueueContract(Base):
     """The queue-side half of the new routes (reference/queue_server.py), as the real queue must implement it."""
 
@@ -521,6 +605,58 @@ class TestQueueContract(Base):
         self.assertEqual(self.req("PUT", path, raw=b"tgz", headers={"X-Lease-Token": "L1"})[0], 200)
         self.assertEqual(self.req("GET", path)[:2], (200, b"tgz"))
         self.assertTrue(json.loads(self.req("GET", "/api/cpu/jobs/%s" % jid)[1])["has_artifacts"])
+
+    def view(self, jid):
+        return json.loads(self.req("GET", "/api/cpu/jobs/%s" % jid)[1])
+
+    def claim(self, runner="r9"):
+        code, body, _ = self.req("POST", "/api/cpu/claim", {"runner_id": runner, "lease_s": 60})
+        return code, (json.loads(body)["job"] if code == 200 else None)
+
+    def test_model_hold_keeps_llm_jobs_queued_and_turns_relay_calls_away(self):
+        up = FakeUpstream()
+        self.addCleanup(up.close)
+        self.store.llm_upstream, self.store.llm_key = up.url, KEY
+        self.store.model_hold = True
+        queued = self.put_job({"cmd": "x", "llm": True}, status="pending", lease=None)
+        plain = self.put_job({"cmd": "x"}, status="pending", lease=None)
+        self.assertEqual(self.view(plain)["waiting"], "no runner online")
+        code, got = self.claim()
+        self.assertEqual((code, got["id"]), (200, plain))           # the older llm job is passed over
+        self.assertEqual(self.claim()[0], 204)
+        v = self.view(queued)
+        self.assertEqual((v["status"], v["model_hold"], v["waiting"]), ("pending", True, queue_server.HOLD_WAITING))
+        v = self.view(plain)
+        self.assertEqual((v["model_hold"], v["waiting"]), (False, None))
+        running = self.put_job({"cmd": "x", "llm": True})
+        code, body, hdrs = self.req("GET", "/api/cpu/jobs/%s/llm/v1/models" % running, headers={"X-Lease-Token": "L1"})
+        self.assertEqual((code, json.loads(body)["error"]["type"], hdrs["Retry-After"]), (503, "sandbox_hold", "30"))
+        self.assertEqual(up.seen, [])                                # nothing went on to the model server
+        v = self.view(running)
+        self.assertEqual((v["model_hold"], v["waiting"], v["llm_calls"], v["llm_held"], v["llm_errors"]),
+                         (True, None, 1, 1, 0))
+        self.store.model_hold = False
+        self.assertEqual(self.req("GET", "/api/cpu/jobs/%s/llm/v1/models" % running,
+                                  headers={"X-Lease-Token": "L1"})[0], 200)
+        self.assertEqual(self.req("POST", "/api/cpu/jobs/%s/llm/v1/chat/completions" % running,
+                                  {"model": "boom", "messages": []}, headers={"X-Lease-Token": "L1"})[0], 429)
+        v = self.view(running)
+        self.assertEqual((v["model_hold"], v["llm_calls"], v["llm_held"], v["llm_errors"]), (False, 3, 1, 1))
+        code, got = self.claim()
+        self.assertEqual((code, got["id"]), (200, queued))           # claimable once the hold is gone
+
+    def test_a_new_attempt_starts_clean(self):
+        jid = self.put_job({"cmd": "x", "llm": True, "log_stream": True, "artifacts": True})
+        with self.store.lock:
+            self.store.jobs[jid].update(log=bytearray(b"old output"), phase="running", progress="9/10", artifacts=b"t",
+                                        llm_calls=4, llm_errors=1, llm_held=2)
+        keys = ("log_size", "phase", "progress", "has_artifacts", "llm_calls", "llm_errors", "llm_held")
+        self.assertEqual([self.view(jid)[k] for k in keys], [10, "running", "9/10", True, 4, 1, 2])
+        self.assertEqual(self.req("POST", "/api/cpu/jobs/%s/release" % jid, {"lease_token": "L1"})[0], 200)
+        code, got = self.claim("r2")
+        self.assertEqual((code, got["id"], got["attempt"]), (200, jid, 2))
+        self.assertEqual([self.view(jid)[k] for k in keys], [0, None, None, False, 0, 0, 0])
+        self.assertEqual(self.req("GET", "/api/cpu/jobs/%s/log?off=0" % jid)[1], b"")
 
 
 class TestRemoteCaps(unittest.TestCase):

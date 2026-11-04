@@ -14,6 +14,8 @@ Remote lane jobs (README "Remote lane jobs") may also ask for: setup= (a prepare
 isolated run, e.g. a project venv), llm= (OpenAI-style model calls relayed through the queue host, which holds the key),
 artifacts= (files the job leaves in $CPU_RUNNER_ARTIFACTS come back as a checked .tgz), on_log= / on_progress= (live
 output and progress line) and cancel_if= (stop it from the caller's side). setup/llm/artifacts never fall back locally.
+While the queue host's models are held (a Darkbloom Sandbox hold), it keeps llm jobs queued: that wait is reported
+through on_progress and result.llm and never counts against claim_timeout_s.
 
 Config (env, overridable by kwargs): CPU_RUNNER_API, CPU_RUNNER_TOKEN_FILE
 (default ~/.config/dispatch-cpu-runner/token) or CPU_RUNNER_TOKEN.
@@ -39,6 +41,7 @@ class CpuJobResult:
     fell_back: bool = False
     artifacts: Optional[dict] = None   # the runner's report {bytes, sha256, http[, warning]} or {error}, when asked
     artifacts_path: Optional[str] = None  # the fetched .tgz (checked against the report), when there is one
+    llm: Optional[dict] = None         # spec.llm jobs: the queue's count {calls, errors, held, hold_wait_s}
 
     def to_dict(self):
         return asdict(self)
@@ -252,8 +255,10 @@ def submit_cpu_job(worktree_path, cmd, timeout_s=600, *, cwd_rel=None, env=None,
                    unreachable_grace_s=60):
     """Run `cmd` for a worktree on the CPU runner; return CpuJobResult.
 
-    claim_timeout_s: if no runner claims the job within this long, cancel and run locally.
-    max_wait_s: hard cap waiting for a claimed job (default timeout_s + 600).
+    claim_timeout_s: if no runner claims the job within this long, cancel and run locally (the queue's reason, e.g.
+      "no runner online", goes into the message). Only time spent pending counts: not the time a spec.llm job waits
+      out a model hold, and a job put back in the queue (its runner died or let it go) starts a fresh window.
+    max_wait_s: hard cap on one claimed attempt (default timeout_s + setup timeout + 600); a re-run gets a fresh one.
     fallback=False raises RuntimeError instead of running locally.
     should_abort: optional callable polled (~every 10s) while the job is still pending; a truthy return (a reason
     string) cancels the job and takes the fallback -- e.g. the runner's heartbeat went stale while we queued.
@@ -264,11 +269,15 @@ def submit_cpu_job(worktree_path, cmd, timeout_s=600, *, cwd_rel=None, env=None,
       and before the isolated run (e.g. build a project venv). A failed setup is a runner failure carrying its log tail.
     llm: True, or a dict of queue-side limits (e.g. {"models": [...], "max_calls": 200}); the job gets
       CPU_RUNNER_LLM_URL, an OpenAI-style base URL relayed through the queue host (the key never reaches the runner).
+      result.llm counts the calls the queue relayed, the errors, the calls that met a model hold, and hold_wait_s (how
+      long the job sat queued behind one).
     artifacts: the job leaves files in $CPU_RUNNER_ARTIFACTS; they come back as a .tgz at result.artifacts_path
       (artifacts_dest, else a temp file the caller owns), checked against the runner's sha256. Problems land in
       result.artifacts["error"]; they never change the job's exit code.
     log_stream / on_log(bytes) / on_progress(phase, progress): live setup + run output (stdout) and the job's
-      progress line ($CPU_RUNNER_PROGRESS); on_log implies log_stream.
+      progress line ($CPU_RUNNER_PROGRESS); on_log implies log_stream. While the job waits in the queue, on_progress
+      gets ("waiting", why) (e.g. "no runner online", the model hold; "queued" once it goes back to the queue). When a
+      runner re-runs the job (attempt 2+), on_log gets a "[cpu_job] the job restarted" line and the new output.
     cancel_if: callable polled every poll_s in ANY state; a truthy return (a reason) cancels the job and returns
       infra_error "cancelled: <reason>" without falling back.
     unreachable_grace_s: how long the queue API may stay unreachable while we wait before giving up on the job.
@@ -336,8 +345,10 @@ def submit_cpu_job(worktree_path, cmd, timeout_s=600, *, cwd_rel=None, env=None,
         t0 = time.time()
         max_wait = max_wait_s or (timeout_s + _setup_timeout(setup) + 600)
         claimed_at = None
-        last_abort_chk = t0
-        log_off, seen, down_since = 0, (None, None), None
+        last_abort_chk = last_t = t0
+        log_off, seen, down_since = 0, None, None
+        attempt = prev_s = why_wait = None
+        pend_s = held_s = 0.0       # time spent pending (the claim clock) / pending behind a model hold (excluded)
         while True:
             why_cancel = _safe_call(cancel_if) if cancel_if is not None else None
             if why_cancel:
@@ -359,9 +370,32 @@ def submit_cpu_job(worktree_path, cmd, timeout_s=600, *, cwd_rel=None, env=None,
                 return fb("job %s vanished from the queue" % job_id)
             st = st if isinstance(st, dict) else {}
             s = st.get("status")
-            if on_progress is not None and (st.get("phase") or st.get("progress")):
-                cur = (st.get("phase"), st.get("progress"))
-                if cur != seen:
+            now = time.time()
+            dt, last_t = now - last_t, now
+            why_wait = None
+            if s == "pending":
+                if prev_s == "running":     # back in the queue (its runner died or let it go): a fresh claim window
+                    pend_s, claimed_at = 0.0, None
+                if st.get("model_hold"):
+                    held_s += dt
+                else:
+                    pend_s += dt
+                why_wait = st.get("waiting") if isinstance(st.get("waiting"), str) else None
+            prev_s = s
+            a = st.get("attempt")
+            if isinstance(a, int) and not isinstance(a, bool):
+                if attempt and a != attempt:    # claimed again: its output, progress and run clock start over
+                    claimed_at, seen = None, None
+                    if on_log is not None and log_off:
+                        _safe_call(on_log, b"\n[cpu_job] the job restarted (attempt %d): its output starts again\n" % a)
+                    log_off = 0
+                attempt = a
+            if on_progress is not None:
+                if s == "pending":
+                    cur = ("waiting", why_wait) if why_wait else (("waiting", "queued") if seen else None)
+                else:
+                    cur = (st.get("phase"), st.get("progress")) if (st.get("phase") or st.get("progress")) else None
+                if cur is not None and cur != seen:
                     seen = cur
                     _safe_call(on_progress, *cur)
             if on_log is not None:          # also drains the rest once the job is done (posted before the result)
@@ -369,7 +403,6 @@ def submit_cpu_job(worktree_path, cmd, timeout_s=600, *, cwd_rel=None, env=None,
             if s in ("done", "failed_infra", "cancelled"):
                 live = False
                 break
-            now = time.time()
             if s == "pending" and should_abort is not None and now - last_abort_chk >= 10:
                 last_abort_chk = now
                 why_abort = _safe_call(should_abort)   # a broken probe must never fail the job
@@ -377,10 +410,10 @@ def submit_cpu_job(worktree_path, cmd, timeout_s=600, *, cwd_rel=None, env=None,
                     _cancel(api, tok, job_id)
                     live = False
                     return fb(str(why_abort))
-            if s == "pending" and now - t0 > claim_timeout_s:
+            if s == "pending" and pend_s > claim_timeout_s:
                 _cancel(api, tok, job_id)
                 live = False
-                return fb("no runner claimed within %ss" % claim_timeout_s)
+                return fb("no runner claimed within %ss%s" % (claim_timeout_s, " (%s)" % why_wait if why_wait else ""))
             if s == "running":
                 claimed_at = claimed_at or now
             if claimed_at and now - claimed_at > max_wait:
@@ -394,6 +427,10 @@ def submit_cpu_job(worktree_path, cmd, timeout_s=600, *, cwd_rel=None, env=None,
         out = CpuJobResult(exit_code=res.get("exit_code"), timed_out=bool(res.get("timed_out")),
                            stdout_tail=res.get("stdout_tail", ""), stderr_tail=res.get("stderr_tail", ""),
                            ran_on="runner", job_id=job_id, timings=res.get("timings") or {})
+        if llm:
+            n = lambda k: st.get(k) if isinstance(st.get(k), int) and not isinstance(st.get(k), bool) else 0  # noqa: E731
+            out.llm = {"calls": n("llm_calls"), "errors": n("llm_errors"), "held": n("llm_held"),
+                       "hold_wait_s": round(held_s, 1)}
         if artifacts:
             rep = res.get("artifacts")
             out.artifacts = dict(rep) if isinstance(rep, dict) else {"error": "the runner sent no artifacts report"}
@@ -446,7 +483,9 @@ if __name__ == "__main__":
     if not a.follow:
         sys.stdout.write(r.stdout_tail)
     sys.stderr.write(r.stderr_tail)
-    print("[cpu_job] ran_on=%s exit=%s timed_out=%s fell_back=%s %s%s" % (
+    print("[cpu_job] ran_on=%s exit=%s timed_out=%s fell_back=%s %s%s%s" % (
         r.ran_on, r.exit_code, r.timed_out, r.fell_back, r.infra_error or "",
-        (" artifacts=%s" % (r.artifacts_path or r.artifacts)) if a.artifacts else ""), file=sys.stderr)
+        (" artifacts=%s" % (r.artifacts_path or r.artifacts)) if a.artifacts else "",
+        (" llm=%(calls)s calls, %(errors)s errors, %(held)s held, %(hold_wait_s)ss hold wait" % r.llm) if r.llm else ""),
+        file=sys.stderr)
     sys.exit(r.exit_code if r.exit_code is not None else 1)

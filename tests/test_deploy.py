@@ -129,7 +129,10 @@ class TestReload(Base):
     def test_sigterm_during_drain_releases_job(self):
         p = self.start_from_copy()
         self.assertTrue(self.wait_for(lambda: self.events("start")))
-        t = threading.Thread(target=lambda: self.submit("sleep 60", timeout_s=120, max_wait_s=100, claim_timeout_s=100), daemon=True)
+        stop = threading.Event()        # the waiting client leaves with the test, never after tearDown took its queue
+        self.addCleanup(stop.set)
+        t = threading.Thread(target=lambda: self.submit("sleep 60", timeout_s=120, max_wait_s=100, claim_timeout_s=100,
+                                                        poll_s=0.2, cancel_if=stop.is_set), daemon=True)
         t.start()
         self.assertTrue(self.wait_for(lambda: any(j["status"] == "running" for j in self.store.jobs.values())))
         open(self.agent_py, "a").write("\n# v2\n")
@@ -138,6 +141,9 @@ class TestReload(Base):
         self.assertTrue(self.wait_for(lambda: p.poll() is not None, 60))
         job = list(self.store.jobs.values())[0]
         self.assertIn(job["status"], ("pending", "cancelled"), "".join(self.lines[-8:]))       # released, not lost
+        stop.set()
+        t.join(10)
+        self.assertFalse(t.is_alive())
 
 
 class TestEnroll(Base):
