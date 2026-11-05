@@ -57,14 +57,24 @@ is fine).
 
 ### Update
 The Unraid Docker tab's *Check for updates* / *Apply update* does not pick up new builds of this image, so update from
-the Unraid shell (pulls the new public image, then recreates the container from its saved template; token, cache, IP
-and MAC persist):
-```
-docker pull ghcr.io/frindle/dispatch-cpu-runner:latest
-/usr/local/emhttp/plugins/dynamix.docker.manager/scripts/update_container dispatch-cpu-runner
-```
-Check: `docker logs --tail 30 dispatch-cpu-runner | grep start` shows the new `version=`. From the queue host,
-`./update.sh --restart` does the same through the Unraid GraphQL API (`--dry-run` shows what it would do). Development override: `docker-compose.dev.yml` builds locally and bind-mounts
+the Unraid shell. Which command depends on how the container was installed:
+
+- **From the template** (Docker tab > Add Container): pull the new public image, then recreate the container from its
+  saved template (token, cache, IP and MAC persist):
+  ```
+  docker pull ghcr.io/frindle/dispatch-cpu-runner:latest
+  /usr/local/emhttp/plugins/dynamix.docker.manager/scripts/update_container dispatch-cpu-runner
+  ```
+- **With `docker-compose.yml`** (the Docker tab lists the container as *3rd Party*; it has no template, so
+  `update_container` cannot recreate it and the old agent keeps running): from the deploy dir,
+  ```
+  cd /mnt/user/appdata/dispatch-cpu-runner && docker compose pull && docker compose up -d
+  ```
+  `up -d` recreates the container only when the image changed; state, cache, IP and MAC persist.
+
+Check: `docker logs --tail 30 dispatch-cpu-runner | grep start` shows the new `version=` (or, on the queue host,
+`cpu_lane.py` status: `runners[].caps.agent`). From the queue host, `./update.sh --restart` does the template update
+through the Unraid GraphQL API (`--dry-run` shows what it would do). Development override: `docker-compose.dev.yml` builds locally and bind-mounts
 `./agent` for hot reload (the agent re-execs itself when its file changes).
 
 ### Re-enroll / rotate the token
