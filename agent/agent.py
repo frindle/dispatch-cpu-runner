@@ -14,6 +14,13 @@ Optional per-job features (each off unless the spec asks; see README "Remote lan
   spec.artifacts   true: tar.gz of $CPU_RUNNER_ARTIFACTS (made as the job user, no link following) PUT before the result
   spec.log_stream  true: setup.log then stdout, plus the job's progress line ($CPU_RUNNER_PROGRESS), posted every few seconds
 
+Limits (README "Disk use"): at most CPU_RUNNER_LANE_MAX lane jobs (spec.setup / spec.llm) run at once; below
+CPU_RUNNER_MIN_FREE_GB free on /work or /cache no lane job is claimed (below 2 GB no job at all); the uv / npm /
+node_modules caches are kept under their caps. Each claim tells the queue what this runner takes (accept) and why it
+takes less (hold), so a waiting job shows the reason; the disk thread reports /work and cache use with the claims.
+CPU_RUNNER_ACCEPT=lane makes a lane-only runner (say a second one beside the main runner): it claims lane jobs only and
+reports hold "plain", so a plain job waiting on it says why.
+
 Subcommands: run (default) | selftest | healthcheck | relay HOST:PORT SOCKET (internal: the in-netns end of the LLM relay)
 Config is env (see README / env.example); a few tunables can also be pulled from the queue API (env wins).
 The shared token comes from CPU_RUNNER_TOKEN_FILE / CPU_RUNNER_TOKEN, else from the state dir (CPU_RUNNER_STATE_DIR/token),
@@ -24,7 +31,7 @@ import subprocess, sys, tarfile, tempfile, threading, time, urllib.error, urllib
 import fcntl
 from http.server import BaseHTTPRequestHandler
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 
 
 def env(name, default=None, cast=str):
@@ -76,13 +83,27 @@ class Config:
         self.log_interval_s = env("CPU_RUNNER_LOG_INTERVAL_S", 3.0, float)
         self.log_max = env("CPU_RUNNER_LOG_MAX", 32 << 20, int)
         self.llm_timeout_s = env("CPU_RUNNER_LLM_TIMEOUT_S", 1200, int)
+        # disk guards (see LOW_DISK_ANY_GB and README "Disk use"); remote-tunable like the settings in REMOTE
+        self.lane_max = max(0, env("CPU_RUNNER_LANE_MAX", 2, int))
+        self.min_free_gb = max(0.0, env("CPU_RUNNER_MIN_FREE_GB", 6.0, float))
+        self.uv_cache_max_gb = env("CPU_RUNNER_UV_CACHE_MAX_GB", 10.0, float)
+        self.npm_cache_max_gb = env("CPU_RUNNER_NPM_CACHE_MAX_GB", 4.0, float)
+        self.nm_cache_max_gb = env("CPU_RUNNER_NM_CACHE_MAX_GB", 6.0, float)
+        self.disk_check_s = max(5.0, env("CPU_RUNNER_DISK_CHECK_S", 120.0, float))
+        # what this runner takes: "all" (default) or "lane" (lane jobs only; checked at startup)
+        self.accept = (env("CPU_RUNNER_ACCEPT", "all") or "all").strip().lower()
 
     # remote-tunable settings: API key -> (attr, env var that overrides it, cast, lo, hi)
     REMOTE = {"concurrency": ("concurrency", "CPU_RUNNER_CONCURRENCY", int, 1, 32),
               "lease_s": ("lease_s", "CPU_RUNNER_LEASE_S", int, 15, 600),
               "max_job_timeout_s": ("max_job_timeout_s", "CPU_RUNNER_MAX_TIMEOUT_S", int, 30, 21600),
               "cache_max_entries": ("cache_max_entries", "CPU_RUNNER_CACHE_MAX", int, 1, 64),
-              "poll_s": ("poll_s", "CPU_RUNNER_POLL_S", float, 0.5, 60)}
+              "poll_s": ("poll_s", "CPU_RUNNER_POLL_S", float, 0.5, 60),
+              "lane_max": ("lane_max", "CPU_RUNNER_LANE_MAX", int, 0, 32),
+              "min_free_gb": ("min_free_gb", "CPU_RUNNER_MIN_FREE_GB", float, 0, 10000),
+              "uv_cache_max_gb": ("uv_cache_max_gb", "CPU_RUNNER_UV_CACHE_MAX_GB", float, 0.5, 10000),
+              "npm_cache_max_gb": ("npm_cache_max_gb", "CPU_RUNNER_NPM_CACHE_MAX_GB", float, 0.5, 10000),
+              "nm_cache_max_gb": ("nm_cache_max_gb", "CPU_RUNNER_NM_CACHE_MAX_GB", float, 0.5, 10000)}
 
     def apply_remote(self, conf):
         """Apply API-provided settings. Explicit env vars always win; values are clamped; isolation is never remote."""
@@ -143,6 +164,52 @@ class Config:
 
 
 PRUNE_PROTECT_S = 600     # node_modules cache entries touched this recently are never evicted (concurrent jobs)
+
+# Disk guards (README "Disk use"). A lane job (spec.setup / spec.llm: a project venv plus a model loop) can take a few
+# GB of /work, so a runner runs at most lane_max of them at once and claims one only with min_free_gb free on both
+# /work and /cache. The caches under /cache are capped: uv (Python packages) and npm are deleted whole once over their
+# cap (while no job runs), node_modules copies (nm) are evicted oldest first.
+LOW_DISK_ANY_GB = 2.0     # below this much free space (or min_free_gb when lower) the runner claims nothing at all
+FREE_RECHECK_S = 5.0      # free space is re-read at most this often (every claim asks)
+REFUSE_BACKOFF_S = 30     # after handing back a job that an older queue gave out against the claim's `accept`
+LANE_ONLY_HOLD = "lane-only runner (CPU_RUNNER_ACCEPT=lane)"   # its standing hold "plain"
+CACHE_REMEASURE_S = 6 * 3600   # the caches are walked after a job that touched them, else only this often
+CLEAN_RETRY_S = 3600      # a cache still over its cap after being deleted is left alone this long (logged)
+CACHES = ("uv", "npm", "nm")
+
+
+def is_lane_job(spec):
+    """A remote lane job: it builds a project venv (spec.setup) and/or runs a model loop (spec.llm). These are the big
+    ones on disk and the long ones; the queue applies the same test to the claim's `accept`."""
+    return isinstance(spec, dict) and bool(spec.get("setup") or spec.get("llm"))
+
+
+def free_gb(path):
+    """Free space in GB on path's filesystem (what an unprivileged writer can use); None when it cannot be read."""
+    try:
+        st = os.statvfs(path)
+    except OSError:
+        return None
+    return st.f_bavail * st.f_frsize / 1e9
+
+
+def du_bytes(path):
+    """Bytes allocated under path: symlinks are not followed, unreadable entries are skipped, a missing path is 0."""
+    total, stack = 0, [path]
+    while stack:
+        try:
+            it = os.scandir(stack.pop())
+        except OSError:
+            continue
+        with it:
+            for e in it:
+                try:
+                    total += e.stat(follow_symlinks=False).st_blocks * 512
+                    if e.is_dir(follow_symlinks=False):
+                        stack.append(e.path)
+                except OSError:
+                    pass
+    return total
 
 
 def log(event, **kw):
@@ -572,6 +639,7 @@ class Job:
         self._log_capped = self._log_dead = False
         self._log_fails = 0
         self._log_sent = None
+        self.touched = set()               # caches (CACHES) this job may have grown; re-measured once it ends
 
     # ---- helpers
     def _t(self, name, t0):
@@ -773,6 +841,7 @@ class Job:
                 self.run_user(["cp", "-a", entry, dest], pkg, env_, 600)
             else:
                 info["cache"] = "miss"
+                self.touched.update(("npm", "nm"))
                 out = os.path.join(self.dir, "out", "install.log")
                 r = self.run_user(["bash", "-c", self.cfg.install_cmd], pkg, env_, self.cfg.install_timeout_s, out)
                 if r.returncode:
@@ -804,16 +873,28 @@ class Job:
         info["seconds"] = round(time.time() - t0, 2)
 
     def _prune(self, nm_cache):
+        """Evict node_modules copies, oldest first: beyond cache_max_entries, then until the rest fits in
+        nm_cache_max_gb. Concurrent jobs: never an entry another job is (or just was) copying from. A hit touches the
+        entry (os.utime), so "recent mtime" == "possibly in use"."""
         try:
             ents = [os.path.join(nm_cache, n) for n in os.listdir(nm_cache) if ".tmp-" not in n]
             ents.sort(key=lambda p: os.stat(p).st_mtime)
-            # Concurrent jobs: never evict an entry another job is (or just was) copying from. A hit touches the
-            # entry (os.utime), so "recent mtime" == "possibly in use".
             now = time.time()
-            ents = [p for p in ents if now - os.stat(p).st_mtime > PRUNE_PROTECT_S]
-            for p in ents[:max(0, len(ents) - self.cfg.cache_max_entries)]:
-                shutil.rmtree(p, ignore_errors=True)
-                log("cache_evict", path=p)
+            old = [p for p in ents if now - os.stat(p).st_mtime > PRUNE_PROTECT_S]
+            gone = set(old[:max(0, len(old) - self.cfg.cache_max_entries)])
+            for p in old:
+                if p in gone:
+                    shutil.rmtree(p, ignore_errors=True)
+                    log("cache_evict", path=p, reason="count")
+            sizes = {p: du_bytes(p) for p in ents if p not in gone}
+            total, cap = sum(sizes.values()), self.cfg.nm_cache_max_gb * 1e9
+            for p in old:
+                if total <= cap:
+                    break
+                if p not in gone:
+                    shutil.rmtree(p, ignore_errors=True)
+                    total -= sizes[p]
+                    log("cache_evict", path=p, reason="size", gb=round(sizes[p] / 1e9, 2))
         except OSError:
             pass
 
@@ -847,6 +928,7 @@ class Job:
         st = self.spec.get("setup")
         if not st:
             return
+        self.touched.update(("uv", "npm"))
         if isinstance(st, str):
             st = {"cmd": st}
         cmd = st.get("cmd") if isinstance(st, dict) else None
@@ -860,7 +942,9 @@ class Job:
         timeout = max(1, min(timeout, self.cfg.setup_timeout_s))
         env_ = self.job_env()
         env_.pop("PIP_NO_INDEX", None)
-        env_.update(UV_CACHE_DIR=os.path.join(self.cfg.cache_dir, "uv"), UV_PYTHON_DOWNLOADS="never")
+        # copy, never hardlink, out of the uv cache: a job's venv then shares no inode with the cache (an in-place edit
+        # cannot reach it, deleting it frees the space, and du does not count it twice); across filesystems uv copies anyway
+        env_.update(UV_CACHE_DIR=os.path.join(self.cfg.cache_dir, "uv"), UV_PYTHON_DOWNLOADS="never", UV_LINK_MODE="copy")
         full = (PID_NS if self.iso_flags == NET_FLAGS_FULL else []) + priv_drop_prefix(self.cfg) + argv
         if self.cfg.nice:
             full = ["nice", "-n", str(self.cfg.nice)] + full
@@ -1270,6 +1354,20 @@ class Agent:
         self._cand = None
         self.caps = {}
         self._caps_sent = 0.0
+        # disk guards (README "Disk use"): the claim gate and the usage report
+        self.gate = threading.Condition()
+        self.jobs_n = 0              # claims in flight that may bring a job + jobs running (a cache cleanup waits for 0)
+        self.lane_n = 0              # lane jobs running
+        self.lane_resv = 0           # claims in flight that may bring back a lane job
+        self.cleanup = None          # why claims are paused while a cache is deleted
+        self.disk = {}               # the last measurement; a claim carries it when new, else every CAPS_RESEND_S
+        self._disk_sent, self._disk_sent_t = None, 0.0
+        self._free, self._free_t = None, 0.0
+        self._sizes = {}             # cache name -> bytes, from the last measurement
+        self._dirty = set(CACHES)    # caches to re-measure: all at first, then the ones a finished job touched
+        self._all_t = 0.0            # the last full re-measure (CACHE_REMEASURE_S)
+        self._clean_after = 0.0      # CLEAN_RETRY_S
+        self._hold_kinds = {}        # what the last "hold" log line said, by kind (logged on change)
 
     # ---- status / health
     def set_status(self, **kw):
@@ -1370,6 +1468,9 @@ class Agent:
             return False
         if self.cfg.isolation == "auto" and not self.iso:
             log("warning", error="NETWORK ISOLATION UNAVAILABLE - jobs run with network")
+        if self.cfg.accept not in ("all", "lane"):
+            log("fatal", error="CPU_RUNNER_ACCEPT must be all or lane, not %r" % self.cfg.accept[:40])
+            return False
         log("start", version=VERSION, runner=self.cfg.runner_id, concurrency=self.cfg.concurrency,
             isolation=self.iso or self.cfg.isolation, api=self.cfg.api, code=(self._src_hash or "")[:12])
         if self.cfg.isolation != "none":
@@ -1394,25 +1495,203 @@ class Agent:
 
     CAPS_RESEND_S = 60      # the queue treats caps older than ~3 min as stale, so a downgraded (old) image ages out
 
-    def claim_body(self):
-        body = {"runner_id": self.cfg.runner_id, "lease_s": self.cfg.lease_s, "slots": self.cfg.concurrency}
-        if self.caps and time.time() - self._caps_sent >= self.CAPS_RESEND_S:
+    def claim_body(self, accept="all", holds=None):
+        """The claim request. accept (what this claim may bring back), hold (why the runner takes less work), lane_max
+        and disk (the usage report) are for the queue's dashboard and checks; a queue that predates them ignores them."""
+        body = {"runner_id": self.cfg.runner_id, "lease_s": self.cfg.lease_s, "slots": self.cfg.concurrency,
+                "accept": accept, "hold": holds or {}, "lane_max": self.cfg.lane_max}
+        now = time.time()
+        if self.caps and now - self._caps_sent >= self.CAPS_RESEND_S:
             body["caps"] = self.caps
+        d = self.disk
+        if d and (d != self._disk_sent or now - self._disk_sent_t >= self.CAPS_RESEND_S):
+            body["disk"] = d
         return body
+
+    def claim_sent(self, body, code):
+        """The queue took the claim (200 / 204): the caps and disk report it carried need not be re-sent for a while."""
+        if code in (200, 204):
+            now = time.time()
+            if "caps" in body:
+                self._caps_sent = now
+            if "disk" in body:
+                self._disk_sent, self._disk_sent_t = body["disk"], now
+
+    # ---- disk guards (README "Disk use")
+    def free_space(self):
+        """(GB, dir): the lower free space of the work and cache dirs, re-read at most every FREE_RECHECK_S; None when
+        neither can be read (nothing is held back then)."""
+        now = time.time()
+        if now - self._free_t >= FREE_RECHECK_S:
+            got = [(g, d) for d in (self.cfg.work_dir, self.cfg.cache_dir) for g in [free_gb(d)] if g is not None]
+            self._free, self._free_t = (min(got) if got else None), now
+        return self._free
+
+    def holds(self):
+        """Why this runner takes less work right now, as the queue shows it: {"all": why} = nothing, {"lane": why} = no
+        lane jobs, {"plain": why} = no plain jobs (a lane-only runner). Call with the gate held."""
+        cfg, h = self.cfg, {}
+        if self.cleanup:
+            h["all"] = self.cleanup
+        fs = self.free_space()
+        if fs is not None:
+            gb, where = fs
+            floor = min(LOW_DISK_ANY_GB, cfg.min_free_gb)
+            if gb < floor:
+                h.setdefault("all", "low disk: %.1f GB free on %s, every job needs %.1f GB" % (gb, where, floor))
+            elif gb < cfg.min_free_gb:
+                h["lane"] = "low disk: %.1f GB free on %s, lane jobs need %.1f GB" % (gb, where, cfg.min_free_gb)
+        if "lane" not in h:
+            if cfg.lane_max <= 0:
+                h["lane"] = "lane jobs are off on this runner (lane_max 0)"
+            elif self.lane_n >= cfg.lane_max:
+                h["lane"] = "lane-job limit: %d of %d running" % (self.lane_n, cfg.lane_max)
+        if cfg.accept == "lane":
+            h["plain"] = LANE_ONLY_HOLD
+        return h
+
+    def plan_claim(self):
+        """What the next claim may bring back, reserved under the gate -> (accept, holds, reserved). accept is "all",
+        "plain" (no lane jobs), "lane" (lane jobs only: a lane-only runner) or "none". Every call is paired with
+        claim_done()."""
+        with self.gate:
+            h = self.holds()
+            kinds = {k: v.split(":")[0] for k, v in h.items()}
+            if kinds != self._hold_kinds:
+                self._hold_kinds = kinds
+                if h:
+                    log("hold", **h)
+                else:
+                    log("hold_cleared")
+            if "all" in h:
+                return "none", h, False
+            lane_full = "lane" in h or self.lane_n + self.lane_resv >= self.cfg.lane_max
+            if lane_full and self.cfg.accept == "lane":
+                return "none", h, False
+            self.jobs_n += 1
+            if lane_full:
+                return "plain", h, False
+            self.lane_resv += 1
+            return ("lane" if self.cfg.accept == "lane" else "all"), h, True
+
+    def claim_done(self, accept, reserved, claim):
+        """The claim call is over -> (run, lane). run is False without a job, and for a job this claim did not accept
+        (an older queue ignores `accept`): the caller gives that one straight back."""
+        with self.gate:
+            if reserved:
+                self.lane_resv -= 1
+            lane = claim is not None and is_lane_job(claim.get("spec"))
+            run = claim is not None and (accept == "all" or (accept == "plain" and not lane) or (accept == "lane" and lane))
+            if run:
+                self.lane_n += lane
+            elif accept != "none":
+                self.jobs_n -= 1
+            self.gate.notify_all()
+            return run, lane
+
+    def job_done(self, lane, touched=()):
+        with self.gate:
+            self.jobs_n -= 1
+            self.lane_n -= bool(lane)
+            self._dirty.update(touched)
+            self._free_t = 0.0            # its scratch dir is gone: re-read the free space before the next claim
+            self.gate.notify_all()
+
+    def give_back(self, claim, event, **kw):
+        """Hand a claimed job straight back to the queue (pending again)."""
+        log(event, job=claim.get("id"), **kw)
+        try:
+            self.api.call("POST", "/api/cpu/jobs/%s/release" % claim.get("id"),
+                          {"runner_id": self.cfg.runner_id, "lease_token": claim.get("lease_token")}, timeout=10)
+        except Exception as e:
+            log("release_error", job=claim.get("id"), error=str(e)[:200])
+
+    def disk_loop(self):
+        """Measures the work dir and the caches for the queue dashboard (the next claim carries the report) and keeps
+        the uv / npm caches under their caps. First pass a few seconds after start, then every disk_check_s."""
+        wait = 5.0
+        while not self.stop.wait(wait):
+            wait = self.cfg.disk_check_s
+            try:
+                self.measure()
+                self.clean_caches()
+            except Exception as e:          # never let the thread die
+                log("disk_error", error=str(e)[:300])
+
+    def measure(self):
+        """Re-measure the work dir, and the caches a finished job touched (all of them at first and every
+        CACHE_REMEASURE_S, so an idle cache dir is not walked for nothing). Publishes and returns self.disk."""
+        cfg, now = self.cfg, time.time()
+        with self.gate:
+            dirty, self._dirty = self._dirty, set()
+        if now - self._all_t >= CACHE_REMEASURE_S:
+            dirty, self._all_t = set(CACHES), now
+        for name in dirty:
+            self._sizes[name] = du_bytes(os.path.join(cfg.cache_dir, name))
+        rep = {"work_gb": du_bytes(cfg.work_dir) / 1e9, "work_free_gb": free_gb(cfg.work_dir),
+               "cache_free_gb": free_gb(cfg.cache_dir), "min_free_gb": cfg.min_free_gb}
+        for name, cap in (("uv", cfg.uv_cache_max_gb), ("npm", cfg.npm_cache_max_gb), ("nm", cfg.nm_cache_max_gb)):
+            rep[name + "_gb"] = self._sizes.get(name, 0) / 1e9
+            rep[name + "_max_gb"] = cap
+        self.disk = {k: round(v, 2) for k, v in rep.items() if v is not None}
+        return self.disk
+
+    def clean_caches(self):
+        """Delete the uv / npm cache once it is over its cap. Both are plain download caches (a job fetches again what
+        it needs), but a running job may be reading or filling one, so claims pause and the deletion waits until no
+        job runs. node_modules copies are capped in Job._prune instead (oldest first, never one in use)."""
+        cfg = self.cfg
+        over = [n for n, cap in (("uv", cfg.uv_cache_max_gb), ("npm", cfg.npm_cache_max_gb))
+                if self._sizes.get(n, 0) > cap * 1e9]
+        if not over or time.time() < self._clean_after:
+            return
+        gb = {n: round(self._sizes[n] / 1e9, 2) for n in over}
+        with self.gate:
+            self.cleanup = "clearing the %s cache (over its cap)" % " and ".join(over)
+            log("cache_cleanup_wait", caches=over, gb=gb, jobs=self.jobs_n)
+            while self.jobs_n > 0 and not self.stop.is_set():
+                self.gate.wait(5)
+        try:
+            if self.stop.is_set():
+                return
+            for n in over:
+                p = os.path.join(cfg.cache_dir, n)
+                if os.path.islink(p):
+                    os.unlink(p)
+                else:
+                    shutil.rmtree(p, ignore_errors=True)
+                log("cache_cleared", cache=n, gb=gb[n])
+            with self.gate:
+                self._dirty.update(over)
+            self.measure()
+            left = [n for n in over if self._sizes.get(n, 0) > getattr(cfg, n + "_cache_max_gb") * 1e9]
+            if left:
+                self._clean_after = time.time() + CLEAN_RETRY_S
+                log("cache_cleanup_incomplete", caches=left, retry_s=CLEAN_RETRY_S)
+        finally:
+            with self.gate:
+                self.cleanup = None
+                self._free_t = 0.0
+                self.gate.notify_all()
 
     def worker(self):
         cfg = self.cfg
+        me = threading.current_thread().name
         while not self.stop.is_set() and not self.draining.is_set():
             self.touch_health()
+            accept, holds, reserved = self.plan_claim()
+            cb, code, body, err = self.claim_body(accept, holds), None, None, None
             try:
-                cb = self.claim_body()
                 code, body = self.api.call("POST", "/api/cpu/claim", cb, timeout=15)
-                if "caps" in cb and code in (200, 204):
-                    self._caps_sent = time.time()
             except Exception as e:
-                log("claim_error", error=str(e))
+                err = e
+            claim = body.get("job") if code == 200 and isinstance(body, dict) else None
+            run, lane = self.claim_done(accept, reserved, claim if isinstance(claim, dict) else None)
+            if err is not None:
+                log("claim_error", error=str(err))
                 self.stop.wait(min(30, cfg.poll_s * 3))
                 continue
+            self.claim_sent(cb, code)
             if code in (401, 403):
                 if self.status.get("api") != "token_rejected":
                     log("token_rejected", http=code, hint="token rejected (rotated?). Mint a new code on the queue host (cpu_lane.py enroll-code), set CPU_RUNNER_ENROLL_CODE, restart")
@@ -1422,25 +1701,36 @@ class Agent:
             if self.status.get("api") != "ok" and code in (200, 204):
                 log("api_ok", api=cfg.api, token="accepted")
                 self.set_status(api="ok")
-            if code != 200 or not body or not body.get("job"):
+            if not isinstance(claim, dict):
                 self.stop.wait(cfg.poll_s)
                 continue
-            claim = body["job"]
-            log("claimed", slot=threading.current_thread().name, active=len(self.active) + 1, job=claim["id"], attempt=claim.get("attempt"), stage=claim["spec"].get("stage"))
-            job = Job(cfg, self.api, claim, self.iso)
-            self.active[threading.current_thread().name] = job
+            if not run:
+                self.give_back(claim, "claim_refused", accept=accept, lane=lane,
+                               hint="this queue API ignores the claim's accept (older version): update it")
+                self.stop.wait(REFUSE_BACKOFF_S)
+                continue
+            log("claimed", slot=me, active=len(self.active) + 1, job=claim["id"], attempt=claim.get("attempt"),
+                stage=claim["spec"].get("stage"), lane=lane)
+            job = None
             try:
+                job = Job(cfg, self.api, claim, self.iso)
+                self.active[me] = job
                 job.run()
             except Exception as e:  # never let the worker thread die
-                log("worker_error", error=str(e))
+                log("worker_error", job=claim["id"], error=str(e))
             finally:
-                self.active.pop(threading.current_thread().name, None)
+                self.active.pop(me, None)
+                self.job_done(lane, job.touched if job is not None else ())
+            if job is None:         # it could not even start (no space for its dir?): hand it back, slow down
+                self.give_back(claim, "job_start_failed")
+                self.stop.wait(REFUSE_BACKOFF_S)
 
     def run(self):
         if not self.setup():
             return 3
         signal.signal(signal.SIGTERM, lambda *_: self.stop.set())
         signal.signal(signal.SIGINT, lambda *_: self.stop.set())
+        threading.Thread(target=self.disk_loop, name="disk", daemon=True).start()
         threads = [threading.Thread(target=self.worker, name="w%d" % i) for i in range(self.cfg.concurrency)]
         for t in threads:
             t.start()

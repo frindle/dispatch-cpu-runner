@@ -56,9 +56,15 @@ macvlan container cannot talk to the Unraid host itself, only to other LAN hosts
 is fine).
 
 ### Update
-Unraid Docker tab > *Check for updates* > *Apply update* (pulls the new public image, recreates from the template; token
-and cache persist). From the queue host: `./update.sh --restart` does the same through the Unraid GraphQL API
-(`--dry-run` shows what it would do). Development override: `docker-compose.dev.yml` builds locally and bind-mounts
+The Unraid Docker tab's *Check for updates* / *Apply update* does not pick up new builds of this image, so update from
+the Unraid shell (pulls the new public image, then recreates the container from its saved template; token, cache, IP
+and MAC persist):
+```
+docker pull ghcr.io/frindle/dispatch-cpu-runner:latest
+/usr/local/emhttp/plugins/dynamix.docker.manager/scripts/update_container dispatch-cpu-runner
+```
+Check: `docker logs --tail 30 dispatch-cpu-runner | grep start` shows the new `version=`. From the queue host,
+`./update.sh --restart` does the same through the Unraid GraphQL API (`--dry-run` shows what it would do). Development override: `docker-compose.dev.yml` builds locally and bind-mounts
 `./agent` for hot reload (the agent re-execs itself when its file changes).
 
 ### Re-enroll / rotate the token
@@ -68,9 +74,11 @@ automatically. With no fresh code the container logs `token_rejected` with the e
 A pasted `CPU_RUNNER_TOKEN` is a fallback only; it is never rotated for you.
 
 ### Settings pulled from the queue
-`concurrency`, `lease_s`, `max_job_timeout_s`, `cache_max_entries` and `node_options` are pulled from `GET /api/cpu/config`
-at start (queue host: `python3 ~/bin/cpu_lane.py config concurrency=3`, applied on next container start). Any env var
-set on the container wins, and isolation is never remote. Container limits (`--cpus=16 --memory=40g`, in Extra Parameters)
+`concurrency`, `lease_s`, `max_job_timeout_s`, `cache_max_entries`, `poll_s`, `node_options` and the disk limits
+`lane_max`, `min_free_gb`, `uv_cache_max_gb`, `npm_cache_max_gb` and `nm_cache_max_gb` (see "Disk use") are pulled from
+`GET /api/cpu/config` at start (queue host: `python3 ~/bin/cpu_lane.py config concurrency=3`, applied on next container
+start). Any env var set on the container wins. `isolation`, `CPU_RUNNER_ACCEPT` and `CPU_RUNNER_DISK_CHECK_S` are never
+remote. Container limits (`--cpus=16 --memory=40g`, in Extra Parameters)
 bound the total; defaults are 5 concurrent jobs sharing 16 CPUs / 40 GiB (about 3 CPU / 8 GiB each; `NODE_OPTIONS` heap 6 GiB worst case x 5 = 30 GiB fits). The runner reports `slots` on every claim; the queue derives busy/saturated per runner. The node_modules cache is flock-guarded per lockfile key, entries touched within 10 min are never evicted, and every job has its own checkout, so two stages of the same worktree never collide.
 
 ## Security
@@ -93,6 +101,68 @@ bound the total; defaults are 5 concurrent jobs sharing 16 CPUs / 40 GiB (about 
 ## Sizing
 Defaults: 5 concurrent jobs (raised from 2 on 2026-10-10; the host is 44 cores / 88 threads / 256 GiB), container limit 16 CPUs / 40 GiB, `NODE_OPTIONS=--max-old-space-size` per job, jobs `nice`d (5).
 Scale by raising concurrency, `--cpus` and `--memory` together.
+At most `CPU_RUNNER_LANE_MAX` (2) of the concurrent jobs are lane jobs (`spec.setup` / `spec.llm`, the longer ones that
+need a prepared environment); the other slots take plain jobs. Disk: up to about 20 GB of caches in `/cache` plus the
+checkouts of the running jobs in `/work`, and the runner wants `CPU_RUNNER_MIN_FREE_GB` (6) free on both before it
+takes a lane job. See "Disk use".
+
+## Disk use
+The runner shares the server's disk with everything else on it, so it caps what it keeps and holds work back when space
+runs low. This is a heuristic, not a quota (see "Not a hard limit" below).
+
+Where the space goes:
+- **`/work`**: the checkouts of the jobs running now. It is Docker storage (the Unraid template does not map it;
+  `docker-compose.yml` uses the named volume `cpu-runner-work`). Each job's dir is removed when the job ends and `/work`
+  is wiped at every start.
+- **`/cache`** (`/mnt/user/appdata/dispatch-cpu-runner/cache`): the npm cache (`npm/`), the node_modules copies (`nm/`)
+  and the uv cache (`uv/`). Appdata already sits on the cache pool, so no extra share is needed. Caps: npm 4 GB,
+  node_modules copies 6 GB and `CPU_RUNNER_CACHE_MAX` (8) entries, uv 10 GB: about 20 GB worst case. Everything in it is
+  rebuilt on demand, so exclude this directory from appdata backups.
+
+Settings (container env; all but the last two also come from the queue, see "Settings pulled from the queue", and an
+env var wins):
+- `CPU_RUNNER_LANE_MAX` (2): most lane jobs running at once. Plain jobs do not count and fill the other slots. `0`
+  turns lane jobs off on this runner.
+- `CPU_RUNNER_MIN_FREE_GB` (6): free space `/work` and `/cache` must each have for the runner to claim a lane job.
+- `CPU_RUNNER_UV_CACHE_MAX_GB` (10), `CPU_RUNNER_NPM_CACHE_MAX_GB` (4), `CPU_RUNNER_NM_CACHE_MAX_GB` (6): the cache caps.
+  `CPU_RUNNER_CACHE_MAX` (8) is the entry limit for the node_modules copies.
+- `CPU_RUNNER_DISK_CHECK_S` (120, at least 5): seconds between the disk thread's passes. Env only.
+- `CPU_RUNNER_ACCEPT` (`all`): `all` or `lane`. Env only: the queue cannot change it. `lane` makes this a lane-only
+  runner, see below. Any other value is fatal at start (the log says `CPU_RUNNER_ACCEPT must be all or lane`, exit
+  code 3).
+
+What the runner does:
+- Below `CPU_RUNNER_MIN_FREE_GB` free on `/work` or `/cache` (whichever has less) it claims no lane job; below 2 GB (or
+  `CPU_RUNNER_MIN_FREE_GB`, if that is lower) it claims no job at all. At the lane limit it claims plain jobs only.
+- Every claim tells the queue what it will take (`accept`) and why it takes less (`hold`), so a job nobody can take
+  shows the reason in its `waiting` text and on the queue dashboard, for example `lane-job limit: 2 of 2 running` or
+  `low disk: 3.1 GB free on /work, lane jobs need 6.0 GB`.
+- The disk thread measures `/work` and the caches (first pass 5 s after the start, then every
+  `CPU_RUNNER_DISK_CHECK_S`; a cache is re-measured after a job that touched it, and all of them every 6 h) and sends
+  the report with the claims.
+- A uv or npm cache over its cap is cleared whole once no job is running. Claims pause meanwhile (the queue shows
+  `clearing the npm cache (over its cap)`), so one long job can hold up new work until it ends; then the cache is
+  deleted and claims resume. A cache still over its cap after that is left alone for an hour.
+- node_modules copies are evicted oldest first after each install: beyond the entry limit, then until the rest fits the
+  cap. A copy used in the last 10 minutes is never evicted.
+
+A lane-only runner (`CPU_RUNNER_ACCEPT=lane`) is for a second runner next to the main one: it takes only lane jobs
+(`spec.setup` / `spec.llm`) and leaves the plain jobs, the gate jobs, to the main runner. Its claims always carry the
+hold `lane-only runner (CPU_RUNNER_ACCEPT=lane)`, so a plain job whose every online runner is lane-only waits with that
+text (with several runners `waiting` lists one reason per runner, `r1: ...; r2: ...`). A plain job queued ahead of a
+lane job does not block it: the queue skips the plain job (its attempt is not touched) and hands the lane job over. The
+other limits still apply: `CPU_RUNNER_LANE_MAX` caps how many lane jobs it runs at once (at that limit it claims
+nothing), and the free-space floors and cache caps work as above. A runner with `all` never sends the `plain` hold.
+
+Not a hard limit: one job can still fill the disk between two checks, and a full `docker.img` (Unraid's Docker storage,
+where `/work` lives) hurts every container on the server, not only this one. If jobs are big, lower
+`CPU_RUNNER_LANE_MAX` or `CPU_RUNNER_CONCURRENCY`.
+
+Update the queue API before the runner. A queue from before `accept` ignores it and may hand a lane job to a runner that
+will not run it: the runner gives it straight back (log event `claim_refused`, with a hint to update the queue) and
+waits 30 s before its next claim. A lane-only runner needs a queue that knows `accept` `lane`: a queue from before it
+treats `lane` as `all` and hands the runner plain jobs, and the runner gives each one back, which costs that job an
+attempt.
 
 ## Layout
 - `agent/agent.py` the runner (claim loop x N threads, heartbeat, deps cache, isolation, enrollment, results)
@@ -117,7 +187,7 @@ group on timeout -> POST exit code, stdout/stderr tails (64 KB), timings.
   package.json + prisma/schema.prisma + node major + arch). Miss: `npm ci --prefer-offline` (+ `prisma generate`
   if prisma is a dependency, network allowed in this phase only), then `cp -a node_modules` into the cache.
   Hit: `cp -a` from the cache. Shared npm cache at `/cache/npm`. Per-key flock so concurrent runners don't
-  double-install. LRU prune to `CPU_RUNNER_CACHE_MAX` (8). Reported as `timings.deps.cache = hit|miss|none`.
+  double-install. LRU prune to `CPU_RUNNER_CACHE_MAX` (8) entries and `CPU_RUNNER_NM_CACHE_MAX_GB` (6), see "Disk use". Reported as `timings.deps.cache = hit|miss|none`.
 - **Env**: jobs get a clean environment (never the agent's, so the token cannot leak) plus spec env keys
   that match `CPU_RUNNER_ENV_ALLOW` (`VERIFY_*,DISPATCH_*,TEST_*,NODE_ENV,CI,TZ,LANG,LC_*,PRISMA_*,DATABASE_URL`).
 - **Timeout**: job in its own session; SIGTERM -> 5 s -> SIGKILL on the group; inside the netns wrapper
@@ -209,21 +279,34 @@ Producer (client):
 - `GET jobs/<id>` -> `{status: uploading|pending|running|done|failed_infra|cancelled, attempt, result, phase, progress,
   log_size, has_artifacts, llm_calls, llm_errors, llm_held, model_hold, waiting}`. `phase` through the llm counts
   belong to the current attempt. `model_hold`: a spec.llm job that is pending or running while the models are held.
-  `waiting` (pending only, else null): why no runner has it, e.g. `no runner online`, `no runner reports <caps>` or the
-  model hold; null when a runner that fits is online and the job is just queued.
+  `waiting` (pending only, else null): why no runner has it, e.g. `no runner online`, `no runner reports <caps>`, the
+  model hold, or the reason every online runner that could take it holds it back (the claim's `hold`, for example
+  `lane-job limit: 2 of 2 running`; with several runners `<runner_id>: <reason>` joined by `; `); null when a runner
+  that fits is online and the job is just queued.
 - `GET jobs/<id>/log?off=N` -> the streamed log from byte N (raw), header `X-Log-Size`
 - `GET jobs/<id>/artifacts` -> the job's artifacts tarball, or 404
 - `DELETE jobs/<id>` -> cancel (pending -> cancelled; running -> heartbeat returns `cancel:true`)
 
 Enrollment and config (agent, see "Enrollment"):
 - `POST enroll` `{code, runner_id}` -> 200 `{token, runner_id, config}`; 403 for an unknown/expired/used code; 429 after repeated failures. Codes are single use.
-- `GET config` -> `{config: {concurrency, lease_s, max_job_timeout_s, cache_max_entries, node_options}}`; explicit env vars on the runner win; `isolation` is never remote.
+- `GET config` -> `{config: {concurrency, lease_s, max_job_timeout_s, cache_max_entries, node_options}}`, plus optionally `poll_s`, `lane_max`, `min_free_gb`, `uv_cache_max_gb`, `npm_cache_max_gb` and `nm_cache_max_gb`; explicit env vars on the runner win; `isolation` is never remote.
 
 Runner (agent):
-- `POST claim` `{runner_id, lease_s, caps?}` (`caps`: capability report, see "Capabilities"; optional, unknown fields are ignored) -> 200 `{job:{id, spec(+has_patch,has_tools), attempt, lease_token}}` or 204.
-  Atomic; picks the oldest `pending` job this runner can take (not a spec.llm job while the models are held; the real
-  queue also matches the spec's remote lane features to the runner's caps); sets lease_expires = now + lease_s and
-  starts the attempt clean (no log, phase, progress, artifacts or llm counts from an earlier one).
+- `POST claim` `{runner_id, lease_s, slots?, caps?, accept?, hold?, lane_max?, disk?}` (`caps`: capability report, see "Capabilities"; optional, unknown fields are ignored) -> 200 `{job:{id, spec(+has_patch,has_tools), attempt, lease_token}}` or 204.
+  Atomic; picks the oldest `pending` job this runner can take (not a spec.llm job while the models are held; not a lane
+  job when `accept` is `plain`; not a plain job when it is `lane`; the real queue also matches the spec's remote lane
+  features to the runner's caps); sets lease_expires = now + lease_s and starts the attempt clean (no log, phase,
+  progress, artifacts or llm counts from an earlier one).
+  The limits (see "Disk use"): `accept` is `all` (also when absent or unknown), `plain` (hand out no lane job, i.e. none
+  whose spec has `setup` or `llm`), `lane` (hand out lane jobs only, for a lane-only runner: a plain job stays queued
+  with its attempt untouched and a lane job behind it is handed out) or `none` (hand out nothing: answer 204 but still
+  store the rest). `hold` `{all?: why, lane?: why, plain?: why}` says why the runner takes less right now; each claim
+  replaces the stored one, so a claim without `hold` clears it, and a pending job's `waiting` shows it once every online
+  runner that could take the job holds it back (`all` holds every job, `lane` holds lane jobs, `plain` holds plain
+  jobs; a lane-only runner always sends `plain`). `lane_max` (int) and `disk` (numbers: `work_gb, work_free_gb,
+  cache_free_gb, min_free_gb, uv_gb, uv_max_gb, npm_gb, npm_max_gb, nm_gb, nm_max_gb`; sent when it changed and at
+  least every 60 s) are kept for the dashboard. A queue that ignores `accept` may hand out a job the runner will not run:
+  the runner answers with `release`.
 - `GET jobs/<id>/payload|patch|tools` -> bytes
 - `POST jobs/<id>/heartbeat` `{runner_id, lease_token, lease_s, phase?, progress?}` -> 200 `{cancel: bool}`; 409 if lease_token no longer holds
 - `POST jobs/<id>/log` `{runner_id, lease_token, off, data_b64, phase, progress}` -> 200 `{size}`; 409 (lease); 400 (bad
@@ -250,7 +333,7 @@ runner reports `infra_error`. `fallback=False` raises instead. Config: `CPU_RUNN
 `claim_timeout_s` counts only time spent pending, not a spec.llm job's wait behind a model hold, and a job put back in
 the queue (its runner died or released it) gets a fresh window, as each new attempt gets a fresh `max_wait_s`
 (default `timeout_s` + the setup timeout + 600). The fallback message carries the queue's reason (`no runner claimed
-within 180s (no runner online)`).
+within 180s (no runner online)`, or a runner's hold such as `lane-job limit: 2 of 2 running`).
 
 Remote lane jobs add `setup=`, `llm=`, `artifacts=` (+ `artifacts_dest=`), `log_stream=` / `on_log=`, `on_progress=`,
 `cancel_if=` and `unreachable_grace_s=` (60). `setup`, `llm` and `artifacts` need `fallback=False`: a local run could
@@ -269,7 +352,12 @@ with its ready handshake, with `env` standing in for `unshare`), key and token n
 artifacts round trip, cap and corrupt download; log streaming, cap and 416 resync; heartbeat progress; job dir modes; the
 client's queue wait (claim clock and the queue's reason, the model hold, a job handed back and re-run with a fresh log,
 an older queue's job view); and the queue-side contract of the new routes, the model hold and per-attempt state. The
-namespace itself is proven by the container's startup selftests.
+namespace itself is proven by the container's startup selftests. `tests/test_limits.py` covers the limits: the lane
+gate and its reservations, the hold texts, the claim's `accept` / `hold` / `lane_max` / `disk`, a job handed back to a
+queue that ignores `accept`, the lane-only runner (`CPU_RUNNER_ACCEPT=lane`: the setting and its refusal of a bad
+value, the standing `plain` hold, the lane reservation, a plain job handed back, and beside a main runner end to end),
+the free-space guard, the cache caps and cleanup, node_modules eviction, and end to end
+against the reference queue (and, where `~/bin` has it, the maintainer's real queue).
 CI runs these and publishes the image on every push to `main` and on `v*` tags.
 
 ## License

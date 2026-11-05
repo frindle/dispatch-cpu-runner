@@ -65,6 +65,7 @@ class Base(unittest.TestCase):
                  CPU_RUNNER_CACHE=os.path.join(self.td, "cache"), CPU_RUNNER_WORK=os.path.join(self.td, "work"),
                  CPU_RUNNER_ISOLATION="none", CPU_RUNNER_POLL_S="0.2", CPU_RUNNER_HEARTBEAT_S="0.5",
                  CPU_RUNNER_LEASE_S="60", CPU_RUNNER_CONCURRENCY="1", CPU_RUNNER_SHUTDOWN_GRACE_S="2",
+                 CPU_RUNNER_MIN_FREE_GB="0",         # the host's free space must not decide whether a lane job is claimed
                  CPU_RUNNER_HEALTH_FILE=os.path.join(self.td, "health"), CPU_RUNNER_ID="r%d" % len(self.procs),
                  PATH=self.bin + os.pathsep + os.environ["PATH"], SECRET_THING="leak-me")
         e.update({k: str(v) for k, v in over.items()})

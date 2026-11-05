@@ -11,10 +11,17 @@ services:
     env_file: .env
     environment:
       CPU_RUNNER_ID: unraid-cpu-1
+      # Disk limits (lane-job cap, free-space floor, cache caps; README "Disk use"): defaults are fine; the queue can set
+      # them (`cpu_lane.py config lane_max=1`) or put them in .env (see env.example), where they win over the queue's.
+      # A second, lane-only runner (it takes lane jobs only, the main runner keeps the plain ones): give it its own
+      # CPU_RUNNER_ID and CPU_RUNNER_ACCEPT: lane here. Env only; the queue must know accept "lane".
     volumes:
-      - ./cache:/cache            # persistent npm + node_modules caches
+      # npm + node_modules + uv caches. Capped at about 20 GB worst case, rebuilt on demand: keep ./cache out of backups.
+      - ./cache:/cache
       - ./state:/state            # the enrolled token lives here (0600); keep it private
-      - cpu-runner-work:/work     # scratch checkouts; named volume, wiped at startup
+      # scratch checkouts: Docker storage (on Unraid that is docker.img; when it fills, every container suffers). Each job's
+      # dir is removed when the job ends and the volume is wiped at startup, so it only holds the jobs running now.
+      - cpu-runner-work:/work
     networks:
       lan:
         ipv4_address: ${CPU_RUNNER_IP:-10.0.12.52}

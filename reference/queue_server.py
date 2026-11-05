@@ -9,6 +9,13 @@ Auth: `Authorization: Bearer <token>` on every request except GET /api/cpu/healt
 Model hold: while the queue host's models are unavailable (`Store.model_hold`, the real queue's Darkbloom Sandbox
 hold), spec.llm jobs stay pending (other jobs are still claimed), their view says why, and a relay call from a job
 already running gets 503 `sandbox_hold` with Retry-After. The real queue first waits for the hold to lift.
+
+Runner limits (agent README "Disk use"): a claim says what it can take, `accept` "all" | "plain" (no lane job, i.e.
+none with spec.setup or spec.llm) | "lane" (lane jobs only) | "none" (absent = "all"), and why the runner takes less
+work, `hold` {"all": why, "lane": why, "plain": why}. A pending job's `waiting` gives those reasons once every
+online runner is held for it. The claim's `lane_max` and `disk` (the runner's usage report) are kept for the
+dashboard. `Store.ignore_accept` makes this server behave like a queue from before `accept` (it hands out the
+oldest pending job regardless).
 """
 import base64, json, re, secrets, threading, time, urllib.error, urllib.parse, urllib.request, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -18,6 +25,11 @@ RUNNER_FRESH_S = 180        # a runner that has not polled for this long is not 
 HOLD_WAITING = "darkbloom sandbox hold: model jobs wait until it is released"
 HOLD_ERROR = "darkbloom sandbox hold: the queue host's models are unloaded until the hold is released"
 PER_ATTEMPT = ("log", "phase", "progress", "artifacts", "llm_calls", "llm_errors", "llm_held")
+
+
+def is_lane(spec):
+    """A lane job (spec.setup / spec.llm): what a claim's accept "plain" and a runner's hold "lane" leave out."""
+    return bool(spec.get("setup") or spec.get("llm"))
 
 
 class Store:
@@ -35,14 +47,26 @@ class Store:
         self.llm_upstream = None
         self.llm_key = None
         self.model_hold = False     # True: the models are unavailable; spec.llm jobs wait (see the module doc)
+        self.runner_hold = {}       # runner_id -> its last claim's `hold` ({} = none)
+        self.runner_lane_max = {}   # runner_id -> its last claim's `lane_max`
+        self.runner_disk = {}       # runner_id -> its last usage report (claim `disk`)
+        self.ignore_accept = False  # True: act like a queue from before `accept` (see the module doc)
 
     def waiting(self, j):
-        """Why a pending job is not being claimed (None: a runner is online, it is just queued)."""
+        """Why a pending job is not being claimed (None: a runner that may take it is online, it is just queued)."""
         if j["spec"].get("llm") and self.model_hold:
             return HOLD_WAITING
-        if not any(t >= self.clock() - RUNNER_FRESH_S for t in self.runner_seen.values()):
+        online = [r for r, t in self.runner_seen.items() if t >= self.clock() - RUNNER_FRESH_S]
+        if not online:
             return "no runner online"
-        return None
+        why = []
+        for r in online:
+            h = self.runner_hold.get(r) or {}
+            w = h.get("all") or (h.get("lane") if is_lane(j["spec"]) else h.get("plain"))
+            if not w:
+                return None
+            why.append("%s: %s" % (r, w) if len(online) > 1 else w)
+        return "; ".join(why)
 
     def reap(self):
         """Lease expiry: running jobs whose lease lapsed go back to pending (or failed_infra)."""
@@ -158,12 +182,24 @@ class H(BaseHTTPRequestHandler):
                 return self._send(201, {"id": jid})
             if method == "POST" and path == "/api/cpu/claim":
                 b = self._json()
-                S.runner_seen[b.get("runner_id")] = S.clock()
+                rid = b.get("runner_id")
+                S.runner_seen[rid] = S.clock()
                 if isinstance(b.get("caps"), dict):
-                    S.runner_caps[b.get("runner_id")] = b["caps"]
+                    S.runner_caps[rid] = b["caps"]
+                hold = b.get("hold") if isinstance(b.get("hold"), dict) else {}
+                S.runner_hold[rid] = {k: str(v)[:300] for k, v in hold.items() if k in ("all", "lane", "plain") and v}
+                if isinstance(b.get("lane_max"), int):
+                    S.runner_lane_max[rid] = b["lane_max"]
+                if isinstance(b.get("disk"), dict):
+                    S.runner_disk[rid] = dict(b["disk"])
+                accept = "all" if S.ignore_accept or b.get("accept") not in ("plain", "lane", "none") else b["accept"]
+                if accept == "none":
+                    return self._send(204)
                 for jid in S.order:
                     j = S.jobs[jid]
-                    if j["status"] == "pending" and not j["cancel"] and not (j["spec"].get("llm") and S.model_hold):
+                    if j["status"] == "pending" and not j["cancel"] and not (j["spec"].get("llm") and S.model_hold) \
+                            and not (accept == "plain" and is_lane(j["spec"])) \
+                            and not (accept == "lane" and not is_lane(j["spec"])):
                         for k in PER_ATTEMPT:       # each attempt starts clean: an earlier one's output is not its
                             j.pop(k, None)
                         j["status"] = "running"

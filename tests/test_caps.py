@@ -68,8 +68,9 @@ class TestImageRecipe(unittest.TestCase):
 class TestClaimBody(unittest.TestCase):
     def test_caps_sent_first_then_only_every_resend_interval(self):
         a = agent_mod.Agent.__new__(agent_mod.Agent)
-        a.cfg = type("C", (), {"runner_id": "r", "lease_s": 60, "concurrency": 5})()
+        a.cfg = type("C", (), {"runner_id": "r", "lease_s": 60, "concurrency": 5, "lane_max": 2})()
         a.caps, a._caps_sent = {"node": 26}, 0.0
+        a.disk, a._disk_sent, a._disk_sent_t = {}, None, 0.0
         self.assertEqual(a.claim_body()["caps"], {"node": 26})
         self.assertEqual(a.claim_body()["slots"], 5)   # saturation signal for the queue
         a._caps_sent = time.time()
@@ -78,6 +79,67 @@ class TestClaimBody(unittest.TestCase):
         self.assertIn("caps", a.claim_body())
         a.caps = {}
         self.assertNotIn("caps", a.claim_body())
+
+    def agent(self, **cfg):
+        a = agent_mod.Agent.__new__(agent_mod.Agent)
+        a.cfg = type("C", (), dict({"runner_id": "r", "lease_s": 60, "concurrency": 5, "lane_max": 2}, **cfg))()
+        a.caps, a._caps_sent = {}, 0.0
+        a.disk, a._disk_sent, a._disk_sent_t = {}, None, 0.0
+        return a
+
+    def test_the_limit_fields_ride_on_every_claim(self):
+        a = self.agent()
+        b = a.claim_body()
+        self.assertEqual((b["accept"], b["hold"], b["lane_max"]), ("all", {}, 2))
+        self.assertEqual(a.claim_body("plain")["accept"], "plain")
+        self.assertEqual(a.claim_body("none")["accept"], "none")
+        self.assertEqual(a.claim_body("lane")["accept"], "lane")      # a lane-only runner (CPU_RUNNER_ACCEPT=lane)
+        hold = {"lane": "lane-job limit: 2 of 2 running"}
+        self.assertEqual(a.claim_body("plain", hold)["hold"], hold)
+        lane_only = dict(hold, plain=agent_mod.LANE_ONLY_HOLD)         # its standing hold: no plain jobs
+        self.assertEqual(a.claim_body("none", lane_only)["hold"], lane_only)
+        self.assertEqual(json.loads(json.dumps(a.claim_body("lane", lane_only))), a.claim_body("lane", lane_only))
+        self.assertEqual(a.claim_body("all", None)["hold"], {})          # no hold is {} on the wire, never null
+        self.assertEqual(json.loads(json.dumps(a.claim_body("plain", hold)))["hold"], hold)
+        self.assertEqual(self.agent(lane_max=0).claim_body()["lane_max"], 0)       # 0 is a setting (lane jobs off)
+        self.assertEqual((b["runner_id"], b["lease_s"], b["slots"]), ("r", 60, 5))
+
+    def test_the_disk_report_goes_out_when_new_changed_or_stale(self):
+        a = self.agent()
+        self.assertNotIn("disk", a.claim_body())                      # nothing measured yet
+        a.disk = {"work_gb": 1.0, "uv_gb": 0.5}
+        b = a.claim_body()
+        self.assertEqual(b["disk"], {"work_gb": 1.0, "uv_gb": 0.5})
+        a.claim_sent(b, 200)
+        self.assertNotIn("disk", a.claim_body())                      # same report, sent a moment ago
+        a.disk = {"work_gb": 1.0, "uv_gb": 0.6}
+        b = a.claim_body()
+        self.assertEqual(b["disk"], {"work_gb": 1.0, "uv_gb": 0.6})   # a new measurement goes out at once
+        a.claim_sent(b, 204)
+        self.assertNotIn("disk", a.claim_body())
+        a._disk_sent_t = time.time() - agent_mod.Agent.CAPS_RESEND_S + 5
+        self.assertNotIn("disk", a.claim_body())
+        a._disk_sent_t = time.time() - agent_mod.Agent.CAPS_RESEND_S - 1
+        self.assertEqual(a.claim_body()["disk"], {"work_gb": 1.0, "uv_gb": 0.6})   # the queue drops old reports: refresh
+
+    def test_only_a_claim_the_queue_took_counts_as_sent(self):
+        a = self.agent()
+        a.caps, a.disk = {"node": 26}, {"work_gb": 1.0}
+        b = a.claim_body()
+        self.assertIn("caps", b)
+        self.assertIn("disk", b)
+        for code in (401, 403, 409, 500, 503):
+            a.claim_sent(b, code)
+        self.assertEqual((a._caps_sent, a._disk_sent, a._disk_sent_t), (0.0, None, 0.0))
+        a.claim_sent({"runner_id": "r"}, 204)                         # a claim that carried neither changes nothing
+        self.assertEqual((a._caps_sent, a._disk_sent, a._disk_sent_t), (0.0, None, 0.0))
+        a.claim_sent(b, 200)
+        self.assertGreater(a._caps_sent, 0.0)
+        self.assertEqual(a._disk_sent, {"work_gb": 1.0})
+        self.assertGreater(a._disk_sent_t, 0.0)
+        later = a.claim_body()
+        self.assertNotIn("caps", later)
+        self.assertNotIn("disk", later)
 
 
 class TestCapsEndToEnd(Base):
