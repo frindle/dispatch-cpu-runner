@@ -104,6 +104,18 @@ def port_free(port):
         s.close()
 
 
+def use_free_llm_port(test):
+    """Point the relay at a free port for this test. Inside a job's own netns LLM_PORT is always free; without a netns
+    (these tests) the relay binds it on the host, where two runs of this suite at once would race for it."""
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    p = mock.patch.object(agent_mod, "LLM_PORT", port)
+    p.start()
+    test.addCleanup(p.stop)
+
+
 def gone(pid):
     """True once pid has exited (a zombie nobody reaped counts as exited)."""
     try:
@@ -264,8 +276,7 @@ class TestLlmRelay(RemoteBase):
     def test_netns_path_relay_subcommand_and_ready_handshake(self):
         """The isolated path: the wrapper starts `agent.py relay` in the background as the job user, the job waits for
         the ready file, and the relay dies with the job. `env` stands in for unshare (no netns here)."""
-        if not port_free(agent_mod.LLM_PORT):
-            self.skipTest("port %d busy on this host" % agent_mod.LLM_PORT)
+        use_free_llm_port(self)
         up = self.upstream()
         cfg = agent_mod.Config()
         cfg.api, cfg.token, cfg.runner_id = self.api, TOKEN, "inproc"
@@ -292,8 +303,7 @@ class TestLlmRelay(RemoteBase):
         self.assertNotIn("llm_relay_error", [e for e, _ in events])
 
     def test_relay_selftest_passes_without_a_netns(self):
-        if not port_free(agent_mod.LLM_PORT):
-            self.skipTest("port %d busy on this host" % agent_mod.LLM_PORT)
+        use_free_llm_port(self)
         cfg = agent_mod.Config()
         cfg.work_dir = os.path.join(self.td, "work")
         os.makedirs(cfg.work_dir, exist_ok=True)
